@@ -157,6 +157,149 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("error", json.loads(result.stdout))
 
+    def _add_policy_and_meeting(self):
+        self.room.add("policy.md", ["legal"])
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.room.add("meeting.txt", ["operations"])
+
+    def test_set_references_roundtrip_and_search(self):
+        self._add_policy_and_meeting()
+        record = self.room.set_references("policy.md", ["meeting.txt", "meeting.txt"])
+        self.assertEqual(record["references"], ["meeting.txt"])
+        self.assertEqual(record["path"], "policy.md")
+        found = self.room.search(["legal"])
+        self.assertEqual(found[0]["references"], ["meeting.txt"])
+        # Omitting targets clears the references but keeps the empty list.
+        record = self.room.set_references("policy.md", [])
+        self.assertEqual(record["references"], [])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["references"], [])
+
+    def test_self_and_mutual_references_allowed(self):
+        self._add_policy_and_meeting()
+        self.assertEqual(self.room.set_references("policy.md", ["policy.md"])["references"],
+                         ["policy.md"])
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_references("meeting.txt", ["policy.md"])
+        manifest = self.room.export_manifest("r", ["legal"], include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertTrue(manifest["complete"])
+
+    def test_set_references_validation(self):
+        self._add_policy_and_meeting()
+        before = self.index.read_text(encoding="utf-8")
+        for source, targets in ((None, []), (7, []), ("absent.md", []),
+                                ("policy.md", "meeting.txt"),
+                                ("policy.md", ["meeting.txt", 3]),
+                                ("policy.md", ["absent.md"])):
+            with self.assertRaises(ValueError):
+                self.room.set_references(source, targets)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # A missing index is an empty index: the source is unregistered and
+        # the index is not created.
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.set_references("policy.md", [])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_set_references_index_integrity(self):
+        self._add_policy_and_meeting()
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_references("policy.md", [])
+        self.index.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_references("policy.md", [])
+        self.index.unlink()
+        self.room.add("policy.md")
+        self.room.add("meeting.txt")
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["policy.md"]["references"] = "meeting.txt"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_references("policy.md", [])
+        stored["policy.md"]["references"] = ["absent.md"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_references("policy.md", [])
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.set_references("policy.md", [])
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_add_preserves_references_on_refresh(self):
+        self._add_policy_and_meeting()
+        first = self.room.add("policy.md")
+        self.assertNotIn("references", first)
+        self.room.set_references("policy.md", ["meeting.txt"])
+        (self.root / "policy.md").write_text("New policy body\n", encoding="utf-8")
+        refreshed = self.room.add("policy.md", ["updated"])
+        self.assertEqual(refreshed["references"], ["meeting.txt"])
+        self.assertEqual(refreshed["tags"], ["updated"])
+
+    def test_manifest_with_references_expands_and_checks(self):
+        self._add_policy_and_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        # Filtering to policy.md still pulls in the referenced meeting.txt.
+        manifest = self.room.export_manifest("r", ["legal"], "policy",
+                                             include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertTrue(manifest["complete"])
+        # Without the flag the same filters keep only policy.md.
+        manifest = self.room.export_manifest("r", ["legal"], "policy")
+        self.assertEqual([d["path"] for d in manifest["documents"]], ["policy.md"])
+        # A modified referenced document is changed and breaks completeness.
+        (self.root / "meeting.txt").write_text("Updated notes\n", encoding="utf-8")
+        manifest = self.room.export_manifest("r", ["legal"], "policy",
+                                             include_references=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["meeting.txt"]["status"], "changed")
+        self.assertEqual(by_path["policy.md"]["status"], "ready")
+        self.assertFalse(manifest["complete"])
+        # Exporting is read-only: the stored metadata is untouched.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["meeting.txt"]["bytes"], len("Notes\n"))
+
+    def test_manifest_with_references_validates_index(self):
+        self._add_policy_and_meeting()
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["policy.md"]["references"] = ["absent.md"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("r", include_references=True)
+        # Records without a references field are treated as having none.
+        del stored["policy.md"]["references"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        manifest = self.room.export_manifest("r", include_references=True)
+        self.assertEqual(len(manifest["documents"]), 2)
+
+    def test_cli_refs_and_export_with_references(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
+        self._add_policy_and_meeting()
+        result = subprocess.run(prefix + ["refs", "policy.md", "--to", "meeting.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["references"], ["meeting.txt"])
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--text", "policy",
+                                          "--with-references"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([d["path"] for d in json.loads(result.stdout)["documents"]],
+                         ["meeting.txt", "policy.md"])
+        # Omitting --to clears the references.
+        result = subprocess.run(prefix + ["refs", "policy.md"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["references"], [])
+        # Unknown source or target is a JSON error with exit 2.
+        result = subprocess.run(prefix + ["refs", "policy.md", "--to", "absent.md"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
 
 if __name__ == "__main__":
     unittest.main()
