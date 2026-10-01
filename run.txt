@@ -1,0 +1,12 @@
+Install
+python3 --version
+Python 3.10 or newer; no third-party dependencies.
+
+Start
+python3 document_room.py add policy.md --tag legal --tag policy
+Prints metadata for the sample policy and saves the local index.
+
+Smoke Test
+python3 document_room.py search --tag legal
+Returns the policy metadata in a JSON array.
+python3 -B -m unittest -v
