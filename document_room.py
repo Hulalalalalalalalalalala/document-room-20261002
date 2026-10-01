@@ -30,6 +30,18 @@ class DocumentRoom:
                 raise ValueError("index record has invalid field types")
         return records
 
+    def _load_validated_with_references(self):
+        records = self._load_validated()
+        for record in records.values():
+            references = record.get("references", [])
+            if (not isinstance(references, list)
+                    or not all(isinstance(target, str) for target in references)):
+                raise ValueError("index record references must be a list of strings")
+            for target in references:
+                if target not in records:
+                    raise ValueError("index record references an unregistered path")
+        return records
+
     def add(self, relative_path, tags=()):
         path = (self.root / relative_path).resolve()
         if not path.is_relative_to(self.root) or not path.is_file():
@@ -40,8 +52,28 @@ class DocumentRoom:
         record = {"path": key, "name": path.name, "bytes": len(content),
                   "sha256": hashlib.sha256(content).hexdigest(), "tags": clean_tags}
         records = self._load()
+        existing = records.get(key)
+        if isinstance(existing, dict) and "references" in existing:
+            record["references"] = existing["references"]
         records[key] = record
         self.index.parent.mkdir(parents=True, exist_ok=True)
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return record
+
+    def set_references(self, relative_path, targets):
+        if not isinstance(relative_path, str):
+            raise ValueError("source path must be a string")
+        if (not isinstance(targets, list)
+                or not all(isinstance(target, str) for target in targets)):
+            raise ValueError("targets must be a list of strings")
+        records = self._load_validated_with_references()
+        if relative_path not in records:
+            raise ValueError("source document is not registered")
+        for target in targets:
+            if target not in records:
+                raise ValueError("reference target is not registered")
+        record = records[relative_path]
+        record["references"] = sorted(set(targets))
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
@@ -50,32 +82,47 @@ class DocumentRoom:
         return [record for _, record in sorted(self._load().items())
                 if wanted.issubset(record["tags"]) and text.casefold() in record["path"].casefold()]
 
-    def export_manifest(self, release, tags=(), text=""):
+    def _file_status(self, record):
+        try:
+            path = (self.root / record["path"]).resolve()
+            if not path.is_relative_to(self.root):
+                return "unsafe"
+            if not path.is_file():
+                return "missing"
+            content = path.read_bytes()
+            return ("ready" if len(content) == record["bytes"]
+                    and hashlib.sha256(content).hexdigest() == record["sha256"]
+                    else "changed")
+        except (OSError, RuntimeError, ValueError):
+            return "unreadable"
+
+    def export_manifest(self, release, tags=(), text="", include_references=False):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+        if include_references:
+            records = self._load_validated_with_references()
+            selected = {}
+            stack = [key for key, record in records.items()
+                     if wanted.issubset(record["tags"])
+                     and text.casefold() in record["path"].casefold()]
+            while stack:
+                key = stack.pop()
+                if key in selected:
+                    continue
+                selected[key] = records[key]
+                stack.extend(records[key].get("references", []))
+            ordered = [selected[key] for key in sorted(selected)]
+        else:
+            ordered = [record for _, record in sorted(self._load_validated().items())
+                       if wanted.issubset(record["tags"])
+                       and text.casefold() in record["path"].casefold()]
         documents = []
-        for _, record in sorted(self._load_validated().items()):
-            if not (wanted.issubset(record["tags"])
-                    and text.casefold() in record["path"].casefold()):
-                continue
-            try:
-                path = (self.root / record["path"]).resolve()
-                if not path.is_relative_to(self.root):
-                    status = "unsafe"
-                elif not path.is_file():
-                    status = "missing"
-                else:
-                    content = path.read_bytes()
-                    status = ("ready" if len(content) == record["bytes"]
-                              and hashlib.sha256(content).hexdigest() == record["sha256"]
-                              else "changed")
-            except (OSError, RuntimeError, ValueError):
-                status = "unreadable"
+        for record in ordered:
             documents.append({"path": record["path"], "name": record["name"],
                               "bytes": record["bytes"], "sha256": record["sha256"],
-                              "tags": record["tags"], "status": status})
+                              "tags": record["tags"], "status": self._file_status(record)})
         return {"release": release,
                 "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
                 "documents": documents}
@@ -92,10 +139,14 @@ def main():
     search = commands.add_parser("search")
     search.add_argument("--tag", action="append", default=[])
     search.add_argument("--text", default="")
+    refs = commands.add_parser("refs")
+    refs.add_argument("path")
+    refs.add_argument("--to", action="append", default=[])
     export = commands.add_parser("export")
     export.add_argument("--release", default="")
     export.add_argument("--tag", action="append", default=[])
     export.add_argument("--text", default="")
+    export.add_argument("--with-references", action="store_true")
     args = parser.parse_args()
     try:
         room = DocumentRoom(args.root, args.index)
@@ -103,8 +154,11 @@ def main():
             result = room.add(args.path, args.tag)
         elif args.command == "search":
             result = room.search(args.tag, args.text)
+        elif args.command == "refs":
+            result = room.set_references(args.path, args.to)
         else:
-            result = room.export_manifest(args.release, args.tag, args.text)
+            result = room.export_manifest(args.release, args.tag, args.text,
+                                          include_references=args.with_references)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:
