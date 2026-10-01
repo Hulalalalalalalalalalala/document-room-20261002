@@ -1,4 +1,4 @@
-"""A local document metadata index with conjunctive tag search."""
+"""A local document metadata index with conjunctive tag search and release manifests."""
 import argparse
 import hashlib
 import json
@@ -12,6 +12,23 @@ class DocumentRoom:
 
     def _load(self):
         return json.loads(self.index.read_text(encoding="utf-8")) if self.index.exists() else {}
+
+    def _load_validated(self):
+        records = self._load()
+        if not isinstance(records, dict):
+            raise ValueError("index must be a JSON object of records")
+        for key, record in records.items():
+            if (not isinstance(key, str) or not isinstance(record, dict)
+                    or record.get("path") != key):
+                raise ValueError("index records must be objects keyed by their path")
+            if (not isinstance(record.get("name"), str)
+                    or not isinstance(record.get("bytes"), int)
+                    or isinstance(record.get("bytes"), bool)
+                    or not isinstance(record.get("sha256"), str)
+                    or not isinstance(record.get("tags"), list)
+                    or not all(isinstance(tag, str) for tag in record["tags"])):
+                raise ValueError("index record has invalid field types")
+        return records
 
     def add(self, relative_path, tags=()):
         path = (self.root / relative_path).resolve()
@@ -33,6 +50,36 @@ class DocumentRoom:
         return [record for _, record in sorted(self._load().items())
                 if wanted.issubset(record["tags"]) and text.casefold() in record["path"].casefold()]
 
+    def export_manifest(self, release, tags=(), text=""):
+        if not isinstance(release, str) or not release.strip():
+            raise ValueError("release must be a non-empty string")
+        release = release.strip()
+        wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+        documents = []
+        for _, record in sorted(self._load_validated().items()):
+            if not (wanted.issubset(record["tags"])
+                    and text.casefold() in record["path"].casefold()):
+                continue
+            try:
+                path = (self.root / record["path"]).resolve()
+                if not path.is_relative_to(self.root):
+                    status = "unsafe"
+                elif not path.is_file():
+                    status = "missing"
+                else:
+                    content = path.read_bytes()
+                    status = ("ready" if len(content) == record["bytes"]
+                              and hashlib.sha256(content).hexdigest() == record["sha256"]
+                              else "changed")
+            except (OSError, RuntimeError, ValueError):
+                status = "unreadable"
+            documents.append({"path": record["path"], "name": record["name"],
+                              "bytes": record["bytes"], "sha256": record["sha256"],
+                              "tags": record["tags"], "status": status})
+        return {"release": release,
+                "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
+                "documents": documents}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -45,10 +92,19 @@ def main():
     search = commands.add_parser("search")
     search.add_argument("--tag", action="append", default=[])
     search.add_argument("--text", default="")
+    export = commands.add_parser("export")
+    export.add_argument("--release", default="")
+    export.add_argument("--tag", action="append", default=[])
+    export.add_argument("--text", default="")
     args = parser.parse_args()
     try:
         room = DocumentRoom(args.root, args.index)
-        result = room.add(args.path, args.tag) if args.command == "add" else room.search(args.tag, args.text)
+        if args.command == "add":
+            result = room.add(args.path, args.tag)
+        elif args.command == "search":
+            result = room.search(args.tag, args.text)
+        else:
+            result = room.export_manifest(args.release, args.tag, args.text)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:

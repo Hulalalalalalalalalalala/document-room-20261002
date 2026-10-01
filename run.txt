@@ -9,4 +9,6 @@ Prints metadata for the sample policy and saves the local index.
 Smoke Test
 python3 document_room.py search --tag legal
 Returns the policy metadata in a JSON array.
+python3 document_room.py export --release "Q4 Launch"
+Checks the registered files and reports ready, changed, missing, unsafe or unreadable; complete is true only when every listed document is ready.
 python3 -B -m unittest -v
