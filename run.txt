@@ -28,7 +28,7 @@ Lists registered documents that reference the target, each with its minimum refe
 python3 document_room.py duplicates --tag release
 Groups registrations with equal stored bytes and SHA-256 into duplicate groups; --tag (repeatable) and --text filter like search and any member match returns the whole group.
 python3 document_room.py compare --before old.json --after new.json
-Diffs two exported manifest snapshots into added, removed, changed and unchanged documents without touching the index or files; --detect-relocations additionally merges leftover pairs with identical stored bytes and SHA-256 (unique on both sides) into a relocated array.
+Diffs two exported manifest snapshots into added, removed, changed and unchanged documents without touching the index or files; --detect-relocations additionally merges leftover pairs with identical stored bytes and SHA-256 (unique on both sides) into a relocated array, and --compare-version-notes also compares each paired document's version_note as an exact string.
 python3 document_room.py import --from records.json
 Merges a UTF-8 JSON object of path-keyed records into the index (metadata only; files are not read), reporting added and unchanged paths; conflicting or invalid records fail the whole batch with exit 2.
 python3 -B -m unittest -v

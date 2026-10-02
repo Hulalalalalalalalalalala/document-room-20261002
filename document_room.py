@@ -593,7 +593,7 @@ class DocumentRoom:
         return manifest
 
     @staticmethod
-    def _changed_fields(old, new):
+    def _changed_fields(old, new, compare_version_notes=False):
         fields = []
         for field in DocumentRoom.COMPARED_FIELDS:
             if field == "tags":
@@ -602,10 +602,16 @@ class DocumentRoom:
                 differs = old[field] != new[field]
             if differs:
                 fields.append(field)
+        if (compare_version_notes
+                # Notes compare as the exact stored strings; a missing field
+                # reads as an empty note. "version_note" sorts after every
+                # COMPARED_FIELDS name, so appending keeps fields name-sorted.
+                and old.get("version_note", "") != new.get("version_note", "")):
+            fields.append("version_note")
         return fields
 
     @staticmethod
-    def _detect_relocations(result):
+    def _detect_relocations(result, compare_version_notes=False):
         # Only the leftover added/removed documents are candidates; documents
         # paired by path never count toward uniqueness. Candidates group by
         # the exact stored bytes and sha256 (the digest's case is significant),
@@ -626,7 +632,8 @@ class DocumentRoom:
             old, new = old_docs[0], new_docs[0]
             relocated.append({"before": old, "after": new,
                               "fields": sorted(["path"]
-                                               + DocumentRoom._changed_fields(old, new))})
+                                               + DocumentRoom._changed_fields(
+                                                   old, new, compare_version_notes))})
         relocated.sort(key=lambda item: (item["before"]["path"], item["after"]["path"]))
         moved_before = {item["before"]["path"] for item in relocated}
         moved_after = {item["after"]["path"] for item in relocated}
@@ -637,11 +644,22 @@ class DocumentRoom:
         return relocated
 
     @staticmethod
-    def compare_manifests(before, after, detect_relocations=False):
+    def compare_manifests(before, after, detect_relocations=False,
+                          compare_version_notes=False):
         if not isinstance(detect_relocations, bool):
             raise ValueError("detect_relocations must be a boolean")
+        if not isinstance(compare_version_notes, bool):
+            raise ValueError("compare_version_notes must be a boolean")
         before = DocumentRoom._validated_manifest(before)
         after = DocumentRoom._validated_manifest(after)
+        if compare_version_notes:
+            # Every document on both sides is checked, paired or not; a bad
+            # note fails the whole comparison before anything is classified.
+            for manifest in (before, after):
+                for document in manifest["documents"]:
+                    if ("version_note" in document
+                            and not isinstance(document["version_note"], str)):
+                        raise ValueError("manifest document version_note must be a string")
         before_docs = {d["path"]: d for d in before["documents"]}
         after_docs = {d["path"]: d for d in after["documents"]}
         before_paths = set(before_docs)
@@ -651,7 +669,7 @@ class DocumentRoom:
         for path in sorted(before_paths & after_paths):
             old = before_docs[path]
             new = after_docs[path]
-            fields = DocumentRoom._changed_fields(old, new)
+            fields = DocumentRoom._changed_fields(old, new, compare_version_notes)
             if fields:
                 changed.append({"path": path, "before": old, "after": new,
                                 "fields": fields})
@@ -666,13 +684,17 @@ class DocumentRoom:
             "unchanged": unchanged,
         }
         if detect_relocations:
-            result["relocated"] = DocumentRoom._detect_relocations(result)
+            result["relocated"] = DocumentRoom._detect_relocations(
+                result, compare_version_notes)
         return result
 
     @staticmethod
-    def compare_manifest_files(before_path, after_path, detect_relocations=False):
+    def compare_manifest_files(before_path, after_path, detect_relocations=False,
+                               compare_version_notes=False):
         if not isinstance(detect_relocations, bool):
             raise ValueError("detect_relocations must be a boolean")
+        if not isinstance(compare_version_notes, bool):
+            raise ValueError("compare_version_notes must be a boolean")
         def load(path):
             with open(path, encoding="utf-8") as handle:
                 return json.load(handle)
@@ -683,8 +705,9 @@ class DocumentRoom:
             raise ValueError(f"manifest file is not valid UTF-8: {exc}")
         except json.JSONDecodeError as exc:
             raise ValueError(f"manifest file is not valid JSON: {exc}")
-        return DocumentRoom.compare_manifests(before, after,
-                                              detect_relocations=detect_relocations)
+        return DocumentRoom.compare_manifests(
+            before, after, detect_relocations=detect_relocations,
+            compare_version_notes=compare_version_notes)
 
 
 def main():
@@ -742,6 +765,7 @@ def main():
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
     compare.add_argument("--detect-relocations", action="store_true")
+    compare.add_argument("--compare-version-notes", action="store_true")
     importer = commands.add_parser("import")
     importer.add_argument("--from", dest="from_path", required=True)
     dump = commands.add_parser("dump")
@@ -779,8 +803,10 @@ def main():
         elif args.command == "duplicates":
             result = room.find_duplicates(args.tag, args.text)
         elif args.command == "compare":
-            result = room.compare_manifest_files(args.before, args.after,
-                                                 detect_relocations=args.detect_relocations)
+            result = room.compare_manifest_files(
+                args.before, args.after,
+                detect_relocations=args.detect_relocations,
+                compare_version_notes=args.compare_version_notes)
         elif args.command == "import":
             try:
                 with open(args.from_path, encoding="utf-8") as handle:
