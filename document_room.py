@@ -199,6 +199,34 @@ class DocumentRoom:
                                   encoding="utf-8")
         return {"added": sorted(added), "unchanged": sorted(unchanged)}
 
+    def export_records(self, tags=(), text="", archive_state="all", category=None):
+        if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must be a list or tuple of strings")
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        self._check_archive_state(archive_state)
+        self._check_category_filter(category)
+        records = self._load_validated_with_categories()
+        wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+
+        def matches(record):
+            return (wanted.issubset(record["tags"])
+                    and text.casefold() in record["path"].casefold()
+                    and self._matches_archive_state(record, archive_state)
+                    and self._matches_category(record, category))
+
+        selected = {}
+        stack = [key for key, record in records.items() if matches(record)]
+        while stack:
+            key = stack.pop()
+            if key in selected:
+                continue
+            selected[key] = records[key]
+            # Dependencies are pulled in regardless of the filters; records
+            # that merely reference a selected one are not.
+            stack.extend(records[key].get("references", []))
+        return {key: selected[key] for key in sorted(selected)}
+
     def reference_impact(self, target, transitive=False):
         if not isinstance(target, str):
             raise ValueError("target path must be a string")
@@ -485,6 +513,11 @@ def main():
     compare.add_argument("--after", required=True)
     importer = commands.add_parser("import")
     importer.add_argument("--from", dest="from_path", required=True)
+    dump = commands.add_parser("dump")
+    dump.add_argument("--tag", action="append", default=[])
+    dump.add_argument("--text", default="")
+    dump.add_argument("--archive-state", default="all")
+    dump.add_argument("--category", default=None)
     args = parser.parse_args()
     try:
         room = DocumentRoom(args.root, args.index)
@@ -513,6 +546,9 @@ def main():
             except json.JSONDecodeError as exc:
                 raise ValueError(f"import file is not valid JSON: {exc}")
             result = room.import_records(batch)
+        elif args.command == "dump":
+            result = room.export_records(args.tag, args.text, args.archive_state,
+                                         args.category)
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references,

@@ -1136,6 +1136,146 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(stored["policy.md"]["bytes"], 10)
 
 
+class DumpTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def test_filter_selects_starts_and_dependencies_follow(self):
+        self.room.add("policy.md", ["legal"])
+        self.room.add("meeting.txt", ["operations"])
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_archived("meeting.txt", True)
+        # Only policy.md matches, but its archived dependency is included.
+        dumped = self.room.export_records(tags=["legal"])
+        self.assertEqual(sorted(dumped), ["meeting.txt", "policy.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(dumped, stored)
+        # The dependency is included even after its file is deleted.
+        (self.root / "meeting.txt").unlink()
+        self.assertEqual(self.room.export_records(tags=["legal"]), stored)
+        # The archive filter only chooses the starting documents.
+        dumped = self.room.export_records(archive_state="active")
+        self.assertEqual(sorted(dumped), ["meeting.txt", "policy.md"])
+        dumped = self.room.export_records(archive_state="archived")
+        self.assertEqual(sorted(dumped), ["meeting.txt"])
+
+    def test_reverse_references_and_shared_and_cyclic_dependencies(self):
+        for name in ("a.md", "b.md", "c.md", "d.md"):
+            (self.root / name).write_text(name + "\n", encoding="utf-8")
+            self.room.add(name, ["keep"] if name == "a.md" else [])
+        self.room.set_references("a.md", ["b.md"])
+        self.room.set_references("b.md", ["c.md", "b.md"])  # self-reference
+        self.room.set_references("c.md", ["a.md"])  # cycle back to the start
+        self.room.set_references("d.md", ["c.md"])  # mere referrer, not a dependency
+        dumped = self.room.export_records(tags=["keep"])
+        self.assertEqual(sorted(dumped), ["a.md", "b.md", "c.md"])
+        self.assertEqual(dumped["b.md"]["references"], ["b.md", "c.md"])
+
+    def test_records_preserved_verbatim(self):
+        batch = {"policy.md": {"path": "policy.md", "name": "policy.md", "bytes": 3,
+                               "sha256": "h", "tags": ["B", "a", "a"],
+                               "references": ["meeting.txt"], "extra": {"x": [1, 1]}},
+                 "meeting.txt": {"path": "meeting.txt", "name": "meeting.txt",
+                                 "bytes": 1, "sha256": "g", "tags": []}}
+        self.room.import_records(batch)
+        dumped = self.room.export_records()
+        self.assertEqual(dumped, batch)
+        self.assertEqual(list(dumped), ["meeting.txt", "policy.md"])
+        self.assertEqual(dumped["policy.md"]["tags"], ["B", "a", "a"])
+
+    def test_missing_index_and_empty_selection_return_empty(self):
+        self.assertEqual(self.room.export_records(), {})
+        self.assertFalse(self.index.exists())
+        self.room.add("policy.md", ["legal"])
+        self.assertEqual(self.room.export_records(tags=["finance"]), {})
+        self.assertEqual(self.room.export_records(text="absent"), {})
+
+    def test_filters_combine_like_search(self):
+        self.room.add("policy.md", ["legal", "policy"])
+        (self.root / "notes.md").write_text("notes\n", encoding="utf-8")
+        self.room.add("notes.md", ["legal"])
+        self.room.set_category("policy.md", "Legal Team")
+        dumped = self.room.export_records(tags=["legal"], text="POL",
+                                          category=" Legal Team ")
+        self.assertEqual(sorted(dumped), ["policy.md"])
+        self.assertEqual(sorted(self.room.export_records(tags=["legal"], category="")),
+                         ["notes.md"])
+
+    def test_invalid_arguments_raise_value_error(self):
+        for tags in ("legal", [1], None):
+            with self.assertRaises(ValueError):
+                self.room.export_records(tags=tags)
+        with self.assertRaises(ValueError):
+            self.room.export_records(text=1)
+        with self.assertRaises(ValueError):
+            self.room.export_records(archive_state="unknown")
+        with self.assertRaises(ValueError):
+            self.room.export_records(category=1)
+
+    def test_invalid_index_fails_even_when_unmatched(self):
+        self.room.add("policy.md", ["legal"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["broken.md"] = {"path": "broken.md", "name": "broken.md", "bytes": 1,
+                               "sha256": "h", "tags": [],
+                               "references": ["unregistered.md"]}
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_records(tags=["legal"])
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_records()
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.export_records()
+
+    def test_dump_output_imports_into_empty_index(self):
+        self.room.add("policy.md", ["legal"])
+        self.room.add("meeting.txt", ["operations"])
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_category("meeting.txt", "Ops")
+        (self.root / "meeting.txt").unlink()
+        dumped = self.room.export_records(tags=["legal"])
+        other = DocumentRoom(self.root, self.root / "other.json")
+        result = other.import_records(dumped)
+        self.assertEqual(result, {"added": ["meeting.txt", "policy.md"], "unchanged": []})
+        self.assertEqual(other.export_records(), dumped)
+
+    def test_cli_dump_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        subprocess.run(prefix + ["add", "policy.md", "--tag", "legal"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "meeting.txt", "--tag", "operations"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["refs", "policy.md", "--to", "meeting.txt"],
+                       capture_output=True, check=True)
+        result = subprocess.run(prefix + ["dump", "--tag", "legal"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(json.loads(result.stdout)),
+                         ["meeting.txt", "policy.md"])
+        result = subprocess.run(prefix + ["dump", "--archive-state", "bogus"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # A missing index prints an empty object and creates nothing.
+        missing = DocumentRoom(self.root, self.root / "absent.json")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "document_room.py"),
+             "--root", str(self.root), "--index", str(self.root / "absent.json"),
+             "dump"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
+        self.assertFalse((self.root / "absent.json").exists())
+        self.assertEqual(missing.export_records(), {})
+
+
 class ManifestComparisonTests(unittest.TestCase):
     def doc(self, path, **overrides):
         document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
