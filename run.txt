@@ -23,4 +23,6 @@ python3 document_room.py compare --before old.json --after new.json
 Diffs two exported manifest snapshots into added, removed, changed and unchanged documents without touching the index or files.
 python3 document_room.py import --from records.json
 Merges a UTF-8 JSON object of path-keyed records into the index (metadata only; files are not read), reporting added and unchanged paths; conflicting or invalid records fail the whole batch with exit 2.
+python3 document_room.py dump --tag legal --text policy
+Prints a bare JSON object of the filtered records and every record they reference, sorted by path; the output imports directly into an empty index, and files are neither read nor copied.
 python3 -B -m unittest -v

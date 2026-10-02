@@ -1349,5 +1349,193 @@ class ManifestComparisonTests(unittest.TestCase):
                              {"before.json", "after.json", "bad.json", "utf8.json"})
 
 
+class DumpTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        (self.root / "notes.md").write_text("More\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+        self.policy = self.room.add("policy.md", [" Legal ", "POLICY"])
+        self.meeting = self.room.add("meeting.txt", ["operations"])
+        self.notes = self.room.add("notes.md", ["operations"])
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_references("meeting.txt", ["notes.md", "meeting.txt"])
+
+    def test_filter_start_then_close_over_forward_references(self):
+        snapshot = self.room.export_records(["legal"], "POLICY")
+        self.assertEqual(list(snapshot), ["meeting.txt", "notes.md", "policy.md"])
+        # Only policy.md matches the filter; both referenced records come along.
+        self.assertEqual(snapshot, {"meeting.txt": {**self.meeting,
+                                                    "references": ["meeting.txt", "notes.md"]},
+                                    "notes.md": self.notes,
+                                    "policy.md": {**self.policy,
+                                                 "references": ["meeting.txt"]}})
+
+    def test_referrers_are_not_pulled_in(self):
+        # meeting.txt does not reference policy.md, so filtering by operations
+        # never includes the policy that points back at meeting.txt.
+        snapshot = self.room.export_records(["operations"])
+        self.assertEqual(list(snapshot), ["meeting.txt", "notes.md"])
+        self.assertNotIn("policy.md", snapshot)
+
+    def test_shared_references_self_references_and_cycles(self):
+        (self.root / "shared.md").write_text("x\n", encoding="utf-8")
+        shared = self.room.add("shared.md")
+        self.room.set_references("meeting.txt", ["notes.md", "shared.md", "meeting.txt"])
+        self.room.set_references("notes.md", ["policy.md"])  # cycle back
+        snapshot = self.room.export_records(text="policy")
+        self.assertEqual(list(snapshot),
+                         ["meeting.txt", "notes.md", "policy.md", "shared.md"])
+        self.assertEqual(snapshot["shared.md"], shared)
+
+    def test_archive_and_category_filters_only_choose_starts(self):
+        self.room.set_archived("meeting.txt", True)
+        self.room.set_category("policy.md", "legal")
+        self.room.set_category("notes.md", "ops")
+        # Archived dependency is still pulled in for an active start.
+        snapshot = self.room.export_records(archive_state="active")
+        self.assertEqual(list(snapshot),
+                         ["meeting.txt", "notes.md", "policy.md"])
+        self.assertTrue(snapshot["meeting.txt"]["archived"])
+        # Category filter: only policy.md starts; deps cross categories.
+        snapshot = self.room.export_records(category="legal")
+        self.assertEqual(list(snapshot), ["meeting.txt", "notes.md", "policy.md"])
+        # Filters combine conjunctively.
+        self.assertEqual(list(self.room.export_records(["legal"], archive_state="archived")),
+                         [])
+
+    def test_records_exported_verbatim_without_live_files(self):
+        before = self.index.read_text(encoding="utf-8")
+        stored = json.loads(before)
+        stored["policy.md"]["extra"] = {"nested": [2, 1, 1], "ws": "  keep "}
+        self.index.write_text(json.dumps(stored, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+        (self.root / "meeting.txt").unlink()
+        snapshot = self.room.export_records(text="policy")
+        # Extra fields, array order, duplicates, case and whitespace survive;
+        # missing optional fields are not filled in.
+        self.assertEqual(snapshot["policy.md"]["extra"],
+                         {"nested": [2, 1, 1], "ws": "  keep "})
+        self.assertEqual(snapshot["meeting.txt"]["references"],
+                         ["meeting.txt", "notes.md"])
+        self.assertNotIn("references", snapshot["notes.md"])
+        self.assertNotIn("archived", snapshot["notes.md"])
+        self.assertNotIn("category", snapshot["notes.md"])
+        # The index is untouched and no snapshot file is written.
+        self.assertEqual(sorted(os.listdir(self.root)), ["index.json", "notes.md",
+                                                         "policy.md"])
+
+    def test_snapshot_roundtrips_into_empty_index(self):
+        snapshot = self.room.export_records(["legal"])
+        target = DocumentRoom(self.root, self.root / "other" / "index.json")
+        result = target.import_records(snapshot)
+        self.assertEqual(result, {"added": ["meeting.txt", "notes.md", "policy.md"],
+                                  "unchanged": []})
+        self.assertEqual(json.loads((self.root / "other" / "index.json").read_text(
+            encoding="utf-8")), snapshot)
+
+    def test_default_selects_every_record_sorted_case_sensitively(self):
+        (self.root / "B.md").write_text("b\n", encoding="utf-8")
+        self.room.add("B.md")
+        snapshot = self.room.export_records()
+        self.assertEqual(list(snapshot),
+                         ["B.md", "meeting.txt", "notes.md", "policy.md"])
+
+    def test_missing_index_or_no_starts_returns_empty_object(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.export_records(), {})
+        self.assertFalse((self.root / "fresh.json").exists())
+        self.assertEqual(self.room.export_records(["nope"]), {})
+        self.assertEqual(self.room.export_records(text="zzz"), {})
+
+    def test_filter_arguments_validated(self):
+        for bad in (None, 7, "legal", ["legal", 1], [0]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_records(bad)
+        for bad in (None, 7, ["x"], b"x"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_records(text=bad)
+        for bad in (None, 7, "active ", ["active"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_records(archive_state=bad)
+        for bad in (7, True, ["legal"], b"legal"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_records(category=bad)
+
+    def test_whole_index_validated_even_when_bad_record_unselected(self):
+        valid = self.index.read_text(encoding="utf-8")
+        # A dangling reference on an unrelated record fails an empty selection.
+        stored = json.loads(valid)
+        stored["notes.md"]["references"] = ["ghost.md"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_records(text="zzz")
+        # Malformed record structure and bad JSON fail too.
+        stored = json.loads(valid)
+        stored["notes.md"]["tags"] = "ops"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_records()
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_records()
+        self.index.write_text(json.dumps([1, 2]), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_records()
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.export_records()
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.export_records()
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_cli_dump_exit_codes_and_roundtrip(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        result = subprocess.run(prefix + ["dump", "--tag", "LEGAL", "--text", "POLICY",
+                                          "--archive-state", "active"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(list(snapshot), ["meeting.txt", "notes.md", "policy.md"])
+        # Import the printed snapshot into an empty index via the CLI.
+        other = self.root / "other.json"
+        snap_path = self.root / "snapshot.json"
+        snap_path.write_text(result.stdout, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+             "--index", str(other), "import", "--from", str(snap_path)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(other.read_text(encoding="utf-8")), snapshot)
+        # Missing index and no starts print {} with exit 0 and create nothing.
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+             "--index", str(self.root / "none.json"), "dump"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "{}")
+        self.assertFalse((self.root / "none.json").exists())
+        # Corrupt index and an illegal archive state print an error with exit 2.
+        self.index.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["dump"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        result = subprocess.run(prefix + ["dump", "--archive-state", "bogus"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # No partial snapshot is printed on failure.
+        self.assertNotIn("policy.md", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
