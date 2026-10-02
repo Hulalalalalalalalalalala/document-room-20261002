@@ -2034,6 +2034,218 @@ class ManifestComparisonTests(unittest.TestCase):
                              {"before.json", "after.json", "bad.json", "utf8.json"})
 
 
+class RelocationDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def doc(self, path, **overrides):
+        document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                    "sha256": "hash-" + path, "tags": ["a"], "status": "ready"}
+        document.update(overrides)
+        return document
+
+    def manifest(self, documents, release="R1", complete=True):
+        return {"release": release, "complete": complete, "documents": documents}
+
+    def _export_meeting_relocation(self, destination="docs/minutes.txt"):
+        # Register the real sample files, export, move the file, migrate the
+        # registration and export again: two offline manifest snapshots.
+        self.room.add("meeting.txt", ["operations"])
+        self.room.add("policy.md", ["legal"])
+        before = self.room.export_manifest("R1")
+        target = self.root / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "meeting.txt").replace(target)
+        self.room.relocate_record("meeting.txt", destination)
+        after = self.room.export_manifest("R2")
+        return before, after
+
+    def test_relocated_pair_detected_from_exported_manifests(self):
+        before, after = self._export_meeting_relocation()
+        result = DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["unchanged"], ["policy.md"])
+        (item,) = result["relocated"]
+        self.assertEqual(set(item), {"before", "after", "fields"})
+        # Both entries are the complete original manifest documents.
+        old = {d["path"]: d for d in before["documents"]}["meeting.txt"]
+        new = {d["path"]: d for d in after["documents"]}["docs/minutes.txt"]
+        self.assertEqual(item["before"], old)
+        self.assertEqual(item["after"], new)
+        self.assertEqual(item["fields"], ["name", "path"])
+
+    def test_detection_off_by_default_keeps_original_structure(self):
+        before, after = self._export_meeting_relocation()
+        for result in (DocumentRoom.compare_manifests(before, after),
+                       DocumentRoom.compare_manifests(before, after,
+                                                      detect_relocations=False)):
+            self.assertNotIn("relocated", result)
+            self.assertEqual([d["path"] for d in result["added"]], ["docs/minutes.txt"])
+            self.assertEqual([d["path"] for d in result["removed"]], ["meeting.txt"])
+            self.assertEqual(result["unchanged"], ["policy.md"])
+
+    def test_duplicate_old_paths_stay_removed_and_added(self):
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("a.txt")
+        self.room.add("b.txt")
+        before = self.room.export_manifest("R1")
+        self.room.remove_record("a.txt")
+        self.room.remove_record("b.txt")
+        (self.root / "c.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("c.txt")
+        after = self.room.export_manifest("R2")
+        result = DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        # Two same-content leftover old paths: no merge is guessed.
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["a.txt", "b.txt"])
+        self.assertEqual([d["path"] for d in result["added"]], ["c.txt"])
+
+    def test_duplicate_new_paths_stay_removed_and_added(self):
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("a.txt")
+        before = self.room.export_manifest("R1")
+        self.room.remove_record("a.txt")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "c.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("b.txt")
+        self.room.add("c.txt")
+        after = self.room.export_manifest("R2")
+        result = DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["a.txt"])
+        self.assertEqual([d["path"] for d in result["added"]], ["b.txt", "c.txt"])
+
+    def test_common_paths_do_not_count_toward_uniqueness(self):
+        (self.root / "shared.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "old.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("shared.txt")
+        self.room.add("old.txt")
+        before = self.room.export_manifest("R1")
+        (self.root / "old.txt").replace(self.root / "new.txt")
+        self.room.relocate_record("old.txt", "new.txt")
+        after = self.room.export_manifest("R2")
+        result = DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        # The unchanged shared.txt has the same content but is paired by path,
+        # so the leftover pair still merges.
+        self.assertEqual(result["unchanged"], ["shared.txt"])
+        (item,) = result["relocated"]
+        self.assertEqual((item["before"]["path"], item["after"]["path"]),
+                         ("old.txt", "new.txt"))
+        self.assertEqual(item["fields"], ["name", "path"])
+
+    def test_relocated_fields_and_sorting(self):
+        before = self.manifest([
+            self.doc("b.md", sha256="h1", tags=["x"], status="ready"),
+            self.doc("a.md", sha256="h2", note="old")])
+        after = self.manifest([
+            self.doc("y.md", sha256="h1", bytes=10, name="renamed.md",
+                     tags=["z"], status="changed"),
+            self.doc("z.md", sha256="h2", name="a.md", note="new")], complete=False)
+        result = DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        # Sorted by the old path, then the new path; extra fields never compare.
+        self.assertEqual([(i["before"]["path"], i["after"]["path"])
+                          for i in result["relocated"]],
+                         [("a.md", "z.md"), ("b.md", "y.md")])
+        self.assertEqual(result["relocated"][0]["fields"], ["path"])
+        self.assertEqual(result["relocated"][1]["fields"],
+                         ["name", "path", "status", "tags"])
+        self.assertEqual(result["relocated"][0]["before"]["note"], "old")
+        self.assertEqual(result["relocated"][0]["after"]["note"], "new")
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+
+    def test_digest_case_is_significant_and_no_candidates_gives_empty(self):
+        before = self.manifest([self.doc("old.md", sha256="ABCD")])
+        after = self.manifest([self.doc("new.md", sha256="abcd")])
+        result = DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["old.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["new.md"])
+        # Nothing leftover at all: still an empty relocated array.
+        same = self.manifest([self.doc("d.md")])
+        result = DocumentRoom.compare_manifests(same, same, detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual(result["unchanged"], ["d.md"])
+
+    def test_detection_does_not_modify_inputs(self):
+        before, after = self._export_meeting_relocation()
+        snapshot = json.dumps([before, after], sort_keys=True)
+        DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        self.assertEqual(json.dumps([before, after], sort_keys=True), snapshot)
+
+    def test_non_boolean_flag_rejected(self):
+        before = self.manifest([self.doc("old.md")])
+        after = self.manifest([self.doc("new.md")])
+        for bad in (1, 0, "yes", None, []):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifests(before, after, detect_relocations=bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifest_files("a.json", "b.json",
+                                                    detect_relocations=bad)
+
+    def test_invalid_manifests_still_rejected_with_detection(self):
+        valid = self.manifest([self.doc("d.md")])
+        bad = self.manifest([self.doc("d.md"), self.doc("d.md")])
+        with self.assertRaises(ValueError):
+            DocumentRoom.compare_manifests(bad, valid, detect_relocations=True)
+        with self.assertRaises(ValueError):
+            DocumentRoom.compare_manifests(valid, bad, detect_relocations=True)
+
+    def test_file_and_cli_compare_with_detection(self):
+        before, after = self._export_meeting_relocation()
+        prefix = [sys.executable, str(ROOT / "document_room.py")]
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            before_path = Path(temp) / "before.json"
+            after_path = Path(temp) / "after.json"
+            before_path.write_text(json.dumps(before), encoding="utf-8")
+            after_path.write_text(json.dumps(after), encoding="utf-8")
+            # The file-based API matches the dict API exactly.
+            from_files = DocumentRoom.compare_manifest_files(
+                before_path, after_path, detect_relocations=True)
+            self.assertEqual(from_files, DocumentRoom.compare_manifests(
+                before, after, detect_relocations=True))
+            (item,) = from_files["relocated"]
+            self.assertEqual(item["fields"], ["name", "path"])
+            # The CLI flag prints the same payload with exit 0.
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(before_path),
+                          "--after", str(after_path), "--detect-relocations"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual([(i["before"]["path"], i["after"]["path"])
+                              for i in payload["relocated"]],
+                             [("meeting.txt", "docs/minutes.txt")])
+            self.assertEqual(payload["added"], [])
+            self.assertEqual(payload["removed"], [])
+            # Without the flag the CLI output has no relocated key.
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(before_path),
+                          "--after", str(after_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("relocated", json.loads(result.stdout))
+            # Failures print an error payload with exit 2 and no partial result.
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(Path(temp) / "missing.json"),
+                          "--after", str(after_path), "--detect-relocations"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            # The inputs are untouched and nothing is created.
+            self.assertEqual(json.loads(before_path.read_text(encoding="utf-8")), before)
+            self.assertEqual(set(os.listdir(temp)), {"before.json", "after.json"})
+
+
 class RelocateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
