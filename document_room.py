@@ -326,11 +326,13 @@ class DocumentRoom:
             stack.extend(records[key].get("references", []))
         return {key: selected[key] for key in sorted(selected)}
 
-    def reference_impact(self, target, transitive=False):
+    def reference_impact(self, target, transitive=False, include_routes=False):
         if not isinstance(target, str):
             raise ValueError("target path must be a string")
         if not isinstance(transitive, bool):
             raise ValueError("transitive must be a boolean")
+        if not isinstance(include_routes, bool):
+            raise ValueError("include_routes must be a boolean")
         records = self._load_validated_with_references()
         if target not in records:
             raise ValueError("target document is not registered")
@@ -350,8 +352,27 @@ class DocumentRoom:
                         nxt.append(source)
             frontier = nxt
             depth += 1
-        documents = [{**records[key], "distance": distances[key]}
-                     for key in sorted(distances, key=lambda key: (distances[key], key))]
+        routes = {}
+        if include_routes:
+            # One shortest chain per referrer, from the referrer to the target.
+            # Built level by level so every next hop's best suffix is already
+            # known; equal-length chains tie-break on the case-sensitive
+            # lexicographic order of the full path array.
+            for key in sorted(distances, key=lambda key: (distances[key], key)):
+                suffixes = []
+                for referenced in records[key].get("references", []):
+                    if referenced == target and distances[key] == 1:
+                        suffixes.append([target])
+                    elif (referenced in distances
+                          and distances[referenced] == distances[key] - 1):
+                        suffixes.append(routes[referenced])
+                routes[key] = [key] + min(suffixes)
+        documents = []
+        for key in sorted(distances, key=lambda key: (distances[key], key)):
+            document = {**records[key], "distance": distances[key]}
+            if include_routes:
+                document["route"] = routes[key]
+            documents.append(document)
         return {"path": target, "documents": documents}
 
     def search(self, tags=(), text="", archive_state="all", category=None):
@@ -614,6 +635,7 @@ def main():
     impact = commands.add_parser("impact")
     impact.add_argument("path")
     impact.add_argument("--transitive", action="store_true")
+    impact.add_argument("--with-routes", action="store_true")
     duplicates = commands.add_parser("duplicates")
     duplicates.add_argument("--tag", action="append", default=[])
     duplicates.add_argument("--text", default="")
@@ -656,7 +678,8 @@ def main():
         elif args.command == "refs":
             result = room.set_references(args.path, args.to)
         elif args.command == "impact":
-            result = room.reference_impact(args.path, transitive=args.transitive)
+            result = room.reference_impact(args.path, transitive=args.transitive,
+                                           include_routes=args.with_routes)
         elif args.command == "duplicates":
             result = room.find_duplicates(args.tag, args.text)
         elif args.command == "compare":
