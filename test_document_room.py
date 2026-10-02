@@ -2246,6 +2246,216 @@ class RelocationDetectionTests(unittest.TestCase):
             self.assertEqual(set(os.listdir(temp)), {"before.json", "after.json"})
 
 
+class VersionNoteComparisonTests(unittest.TestCase):
+    def doc(self, path, **overrides):
+        document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                    "sha256": "hash-" + path, "tags": ["a"], "status": "ready"}
+        document.update(overrides)
+        return document
+
+    def manifest(self, documents, release="R1", complete=True):
+        return {"release": release, "complete": complete, "documents": documents}
+
+    def test_note_only_change_is_changed_with_note_field(self):
+        before = self.manifest([self.doc("d.md", version_note="v1")])
+        after = self.manifest([self.doc("d.md", version_note="v2")])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                compare_version_notes=True)
+        self.assertEqual(result["unchanged"], [])
+        (item,) = result["changed"]
+        self.assertEqual(item["path"], "d.md")
+        self.assertEqual(item["fields"], ["version_note"])
+        # Both complete original documents are kept, notes included.
+        self.assertEqual(item["before"], before["documents"][0])
+        self.assertEqual(item["after"], after["documents"][0])
+
+    def test_note_change_joins_sorted_fields(self):
+        before = self.manifest([self.doc("d.md", bytes=1, status="ready",
+                                         version_note="old")])
+        after = self.manifest([self.doc("d.md", bytes=2, status="changed",
+                                        version_note="new")])
+        (item,) = DocumentRoom.compare_manifests(
+            before, after, compare_version_notes=True)["changed"]
+        self.assertEqual(item["fields"], ["bytes", "status", "version_note"])
+
+    def test_notes_compare_as_exact_strings(self):
+        cases = (("v1", "V1"), ("v1", " v1 "), ("v1", "v1\n"),
+                 ("a b", "a  b"), ("v1", "v1 "))
+        for old_note, new_note in cases:
+            result = DocumentRoom.compare_manifests(
+                self.manifest([self.doc("d.md", version_note=old_note)]),
+                self.manifest([self.doc("d.md", version_note=new_note)]),
+                compare_version_notes=True)
+            self.assertEqual([c["fields"] for c in result["changed"]],
+                             [["version_note"]], msg=f"{old_note!r} vs {new_note!r}")
+        same = DocumentRoom.compare_manifests(
+            self.manifest([self.doc("d.md", version_note="v1")]),
+            self.manifest([self.doc("d.md", version_note="v1")]),
+            compare_version_notes=True)
+        self.assertEqual(same["unchanged"], ["d.md"])
+
+    def test_missing_note_equals_empty_string(self):
+        for old_doc, new_doc in (
+                (self.doc("d.md"), self.doc("d.md", version_note="")),
+                (self.doc("d.md", version_note=""), self.doc("d.md"))):
+            result = DocumentRoom.compare_manifests(
+                self.manifest([old_doc]), self.manifest([new_doc]),
+                compare_version_notes=True)
+            self.assertEqual(result["unchanged"], ["d.md"])
+            self.assertEqual(result["changed"], [])
+        # Missing vs a real note differs; the returned documents are not
+        # rewritten with a filled-in note.
+        before = self.manifest([self.doc("d.md")])
+        after = self.manifest([self.doc("d.md", version_note="v1")])
+        (item,) = DocumentRoom.compare_manifests(
+            before, after, compare_version_notes=True)["changed"]
+        self.assertEqual(item["fields"], ["version_note"])
+        self.assertNotIn("version_note", item["before"])
+        self.assertEqual(item["after"]["version_note"], "v1")
+
+    def test_off_by_default_keeps_notes_uncompared_and_unvalidated(self):
+        before = self.manifest([self.doc("d.md", version_note="old")])
+        after = self.manifest([self.doc("d.md", version_note="new")])
+        for result in (DocumentRoom.compare_manifests(before, after),
+                       DocumentRoom.compare_manifests(before, after,
+                                                      compare_version_notes=False)):
+            self.assertEqual(result["unchanged"], ["d.md"])
+            self.assertEqual(result["changed"], [])
+        # With the option off, even a non-string note is preserved, not checked.
+        before = self.manifest([self.doc("d.md", version_note=None)])
+        after = self.manifest([self.doc("d.md", version_note=5)])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["unchanged"], ["d.md"])
+
+    def test_non_boolean_flag_rejected(self):
+        before = self.manifest([self.doc("d.md")])
+        after = self.manifest([self.doc("d.md")])
+        for bad in (1, 0, "yes", None, []):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifests(before, after,
+                                               compare_version_notes=bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifest_files("a.json", "b.json",
+                                                    compare_version_notes=bad)
+
+    def test_non_string_note_rejected_anywhere_when_enabled(self):
+        valid = self.manifest([self.doc("d.md")])
+        for bad_note in (None, 5, 1.5, True, ["v1"], {"v": 1}):
+            # On a paired document, on either side.
+            bad = self.manifest([self.doc("d.md", version_note=bad_note)])
+            with self.assertRaises(ValueError, msg=repr(bad_note)):
+                DocumentRoom.compare_manifests(bad, valid,
+                                               compare_version_notes=True)
+            with self.assertRaises(ValueError, msg=repr(bad_note)):
+                DocumentRoom.compare_manifests(valid, bad,
+                                               compare_version_notes=True)
+            # On a document that only appears on one side and never pairs.
+            one_sided = self.manifest([self.doc("d.md"),
+                                       self.doc("extra.md", version_note=bad_note)])
+            with self.assertRaises(ValueError, msg=repr(bad_note)):
+                DocumentRoom.compare_manifests(one_sided, valid,
+                                               compare_version_notes=True)
+
+    def test_inputs_are_not_modified(self):
+        before = self.manifest([self.doc("d.md", version_note="old")])
+        after = self.manifest([self.doc("d.md", version_note="new")])
+        snapshot = json.dumps([before, after], sort_keys=True)
+        DocumentRoom.compare_manifests(before, after, compare_version_notes=True)
+        self.assertEqual(json.dumps([before, after], sort_keys=True), snapshot)
+
+    def test_added_removed_and_empty_manifests_keep_original_classification(self):
+        before = self.manifest([self.doc("old.md", version_note=None)])
+        after = self.manifest([self.doc("new.md", version_note="v1")])
+        # The bad note sits on a removed document: still rejected when enabled.
+        with self.assertRaises(ValueError):
+            DocumentRoom.compare_manifests(before, after,
+                                           compare_version_notes=True)
+        before = self.manifest([self.doc("old.md", version_note="v1")])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                compare_version_notes=True)
+        self.assertEqual([d["path"] for d in result["removed"]], ["old.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["new.md"])
+        self.assertEqual(result["changed"], [])
+        empty = DocumentRoom.compare_manifests(self.manifest([]), self.manifest([]),
+                                               compare_version_notes=True)
+        self.assertEqual(empty["changed"], [])
+        self.assertEqual(empty["unchanged"], [])
+
+    def test_relocated_pair_reports_note_difference(self):
+        before = self.manifest([
+            self.doc("old.md", sha256="h1", version_note="v1")])
+        after = self.manifest([
+            self.doc("new.md", sha256="h1", bytes=10, version_note="v2")])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True,
+                                                compare_version_notes=True)
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        (item,) = result["relocated"]
+        self.assertEqual(item["fields"], ["name", "path", "version_note"])
+        # A note-only difference does not affect pairing eligibility.
+        same_note = self.manifest([
+            self.doc("new.md", sha256="h1", bytes=10, version_note="v1")])
+        result = DocumentRoom.compare_manifests(before, same_note,
+                                                detect_relocations=True,
+                                                compare_version_notes=True)
+        self.assertEqual(result["relocated"][0]["fields"], ["name", "path"])
+
+    def test_file_and_cli_compare_with_version_notes(self):
+        before = self.manifest([self.doc("d.md", version_note="v1"),
+                                self.doc("same.md", version_note="keep")])
+        after = self.manifest([self.doc("d.md", version_note="v2"),
+                               self.doc("same.md", version_note="keep")],
+                              release="R2", complete=False)
+        prefix = [sys.executable, str(ROOT / "document_room.py")]
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            before_path = Path(temp) / "before.json"
+            after_path = Path(temp) / "after.json"
+            before_path.write_text(json.dumps(before), encoding="utf-8")
+            after_path.write_text(json.dumps(after), encoding="utf-8")
+            # The file-based API matches the dict API exactly.
+            from_files = DocumentRoom.compare_manifest_files(
+                before_path, after_path, compare_version_notes=True)
+            self.assertEqual(from_files, DocumentRoom.compare_manifests(
+                before, after, compare_version_notes=True))
+            self.assertEqual([c["fields"] for c in from_files["changed"]],
+                             [["version_note"]])
+            self.assertEqual(from_files["unchanged"], ["same.md"])
+            # The CLI flag prints the same payload with exit 0.
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(before_path),
+                          "--after", str(after_path), "--compare-version-notes"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual([c["fields"] for c in payload["changed"]],
+                             [["version_note"]])
+            self.assertEqual(payload["unchanged"], ["same.md"])
+            # Without the flag the CLI keeps notes uncompared.
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(before_path),
+                          "--after", str(after_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["unchanged"],
+                             ["d.md", "same.md"])
+            # A non-string note fails with an error payload and exit 2.
+            bad_path = Path(temp) / "bad.json"
+            bad_path.write_text(json.dumps(
+                self.manifest([self.doc("d.md", version_note=None)])),
+                encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(bad_path),
+                          "--after", str(after_path), "--compare-version-notes"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            # The inputs are untouched and nothing is created.
+            self.assertEqual(json.loads(before_path.read_text(encoding="utf-8")), before)
+            self.assertEqual(set(os.listdir(temp)),
+                             {"before.json", "after.json", "bad.json"})
+
+
 class RelocateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
