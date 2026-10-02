@@ -433,5 +433,207 @@ class DocumentRoomTests(unittest.TestCase):
             self.assertIn("error", json.loads(result.stdout))
 
 
+def make_document(path, **overrides):
+    document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                "sha256": "hash-" + path, "tags": ["legal"], "status": "ready"}
+    document.update(overrides)
+    return document
+
+
+def make_manifest(release="R1", complete=True, documents=()):
+    return {"release": release, "complete": complete,
+            "documents": list(documents)}
+
+
+class CompareManifestsTests(unittest.TestCase):
+    def setUp(self):
+        self.before = make_manifest("R1", True, [
+            make_document("removed.md"),
+            make_document("same.md"),
+            make_document("tags.md", tags=["a", "b"]),
+            make_document("tweaked.md", name="old name", bytes=1,
+                          sha256="old", status="ready"),
+            make_document("status.md", status="ready"),
+            make_document("extra.md"),
+        ])
+        self.after = make_manifest("R2", False, [
+            make_document("added.md"),
+            make_document("same.md"),
+            make_document("tags.md", tags=["b", "b", "a"]),
+            make_document("tweaked.md", name="new name", bytes=2,
+                          sha256="new", status="changed"),
+            make_document("status.md", status="missing"),
+            make_document("extra.md", custom="kept"),
+        ])
+
+    def test_classifies_added_removed_changed_unchanged_sorted(self):
+        result = DocumentRoom.compare_manifests(self.before, self.after)
+        self.assertEqual(result["before"], {"release": "R1", "complete": True})
+        self.assertEqual(result["after"], {"release": "R2", "complete": False})
+        self.assertEqual([d["path"] for d in result["added"]], ["added.md"])
+        self.assertEqual([d["path"] for d in result["removed"]], ["removed.md"])
+        # Full documents are returned, not just paths.
+        self.assertEqual(result["added"][0], self.after["documents"][0])
+        self.assertEqual(result["removed"][0], self.before["documents"][0])
+        self.assertEqual(result["unchanged"], ["extra.md", "same.md", "tags.md"])
+        changed = {item["path"]: item for item in result["changed"]}
+        self.assertEqual(sorted(changed), ["status.md", "tweaked.md"])
+        self.assertEqual(changed["status.md"]["fields"], ["status"])
+        self.assertEqual(changed["tweaked.md"]["fields"],
+                         ["bytes", "name", "sha256", "status"])
+        self.assertEqual(changed["tweaked.md"]["before"],
+                         make_document("tweaked.md", name="old name", bytes=1,
+                                       sha256="old", status="ready"))
+        self.assertEqual(changed["tweaked.md"]["after"],
+                         make_document("tweaked.md", name="new name", bytes=2,
+                                       sha256="new", status="changed"))
+
+    def test_tags_compare_as_sets_and_extra_fields_ignored(self):
+        # tags.md has the same tag set in a different order with a duplicate:
+        # unchanged, while extra.md differs only in an extra field: unchanged too.
+        result = DocumentRoom.compare_manifests(self.before, self.after)
+        self.assertIn("tags.md", result["unchanged"])
+        self.assertIn("extra.md", result["unchanged"])
+        # Extra fields are preserved verbatim on the compared document.
+        self.after["documents"][-1]["another"] = [1, 2]
+        result = DocumentRoom.compare_manifests(self.before, self.after)
+        self.assertEqual([p for p in result["unchanged"] if p == "extra.md"], ["extra.md"])
+        # Tag case and whitespace are not normalized.
+        before = make_manifest(documents=[make_document("d", tags=["Legal"])])
+        after = make_manifest(documents=[make_document("d", tags=["legal"])])
+        self.assertEqual(DocumentRoom.compare_manifests(before, after)["changed"][0]["fields"],
+                         ["tags"])
+
+    def test_paths_are_case_sensitive_and_not_normalized(self):
+        before = make_manifest(documents=[make_document("Docs/A.md"),
+                                          make_document("./b.md")])
+        after = make_manifest(documents=[make_document("docs/a.md"),
+                                         make_document("b.md")])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual([d["path"] for d in result["added"]], ["b.md", "docs/a.md"])
+        self.assertEqual([d["path"] for d in result["removed"]], ["./b.md", "Docs/A.md"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["unchanged"], [])
+
+    def test_same_manifest_is_everything_unchanged(self):
+        result = DocumentRoom.compare_manifests(self.before, self.before)
+        self.assertEqual(result["before"], result["after"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["unchanged"],
+                         sorted(d["path"] for d in self.before["documents"]))
+
+    def test_two_empty_manifests_have_four_empty_categories(self):
+        result = DocumentRoom.compare_manifests(make_manifest(), make_manifest("R2", False))
+        self.assertEqual(result, {"before": {"release": "R1", "complete": True},
+                                  "after": {"release": "R2", "complete": False},
+                                  "added": [], "removed": [],
+                                  "changed": [], "unchanged": []})
+
+    def test_release_and_complete_changes_never_classify_documents(self):
+        before = make_manifest("R1", True, [make_document("d.md")])
+        after = make_manifest("R2", False, [make_document("d.md")])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["unchanged"], ["d.md"])
+        self.assertEqual(result["changed"], [])
+
+    def test_each_path_appears_once_and_inputs_are_not_modified(self):
+        snapshot = json.dumps(self.before, sort_keys=True)
+        DocumentRoom.compare_manifests(self.before, self.after)
+        self.assertEqual(json.dumps(self.before, sort_keys=True), snapshot)
+
+    def test_invalid_manifests_raise_value_error(self):
+        good = make_manifest(documents=[make_document("d.md")])
+        bad_manifests = [
+            None, [], "x", 7,
+            {}, {"complete": True, "documents": []},
+            {"release": "R", "documents": []},
+            {"release": "R", "complete": False, "documents": {}},
+            {"release": "", "complete": False, "documents": []},
+            {"release": "  ", "complete": False, "documents": []},
+            {"release": 7, "complete": False, "documents": []},
+            {"release": "R", "complete": "yes", "documents": []},
+        ]
+        for bad in bad_manifests:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifests(bad, good)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifests(good, bad)
+        bad_documents = [
+            None, [], "d",
+            {}, {"path": "d"}, {"path": "d", "name": "n"},
+            {"path": 7, "name": "n", "bytes": 1, "sha256": "h", "tags": [], "status": "ready"},
+            {"path": "d", "name": 7, "bytes": 1, "sha256": "h", "tags": [], "status": "ready"},
+            {"path": "d", "name": "n", "bytes": True, "sha256": "h", "tags": [], "status": "ready"},
+            {"path": "d", "name": "n", "bytes": "1", "sha256": "h", "tags": [], "status": "ready"},
+            {"path": "d", "name": "n", "bytes": 1, "sha256": 7, "tags": [], "status": "ready"},
+            {"path": "d", "name": "n", "bytes": 1, "sha256": "h", "tags": "t", "status": "ready"},
+            {"path": "d", "name": "n", "bytes": 1, "sha256": "h", "tags": [7], "status": "ready"},
+            {"path": "d", "name": "n", "bytes": 1, "sha256": "h", "tags": [], "status": "bogus"},
+            {"path": "d", "name": "n", "bytes": 1, "sha256": "h", "tags": [], "status": None},
+        ]
+        for document in bad_documents:
+            bad = make_manifest(documents=[document])
+            with self.assertRaises(ValueError, msg=repr(document)):
+                DocumentRoom.compare_manifests(bad, good)
+        duplicate = make_manifest(documents=[make_document("d.md"), make_document("d.md")])
+        with self.assertRaises(ValueError):
+            DocumentRoom.compare_manifests(duplicate, good)
+        with self.assertRaises(ValueError):
+            DocumentRoom.compare_manifests(good, duplicate)
+
+    def test_cli_compare_roundtrip_and_exit_codes(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py")]
+        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temp.cleanup)
+        before_path = Path(temp.name) / "before.json"
+        after_path = Path(temp.name) / "after.json"
+        before_path.write_text(json.dumps(self.before), encoding="utf-8")
+        after_path.write_text(json.dumps(self.after), encoding="utf-8")
+        result = subprocess.run(prefix + ["compare", "--before", str(before_path),
+                                          "--after", str(after_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["before"], {"release": "R1", "complete": True})
+        self.assertEqual([d["path"] for d in payload["added"]], ["added.md"])
+        self.assertEqual([d["path"] for d in payload["removed"]], ["removed.md"])
+        self.assertEqual(payload["unchanged"], ["extra.md", "same.md", "tags.md"])
+        # Malformed JSON and invalid structures are JSON errors with exit 2.
+        bad_path = Path(temp.name) / "bad.json"
+        bad_path.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["compare", "--before", str(bad_path),
+                                          "--after", str(after_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        bad_path.write_text(json.dumps(make_manifest(documents=[
+            {"path": "d", "name": "n", "bytes": 1, "sha256": "h",
+             "tags": [], "status": "bogus"}])), encoding="utf-8")
+        result = subprocess.run(prefix + ["compare", "--before", str(before_path),
+                                          "--after", str(bad_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # Invalid UTF-8 is a decode error with exit 2.
+        bad_path.write_bytes(b"\xff\xfe{")
+        result = subprocess.run(prefix + ["compare", "--before", str(bad_path),
+                                          "--after", str(after_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # A missing file is an OSError with exit 2.
+        missing = Path(temp.name) / "missing.json"
+        result = subprocess.run(prefix + ["compare", "--before", str(missing),
+                                          "--after", str(after_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # The input files are untouched and no output files are created.
+        self.assertEqual(json.loads(before_path.read_text(encoding="utf-8")), self.before)
+        self.assertFalse((Path(temp.name) / "comparison.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

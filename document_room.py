@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 
 
+DOCUMENT_STATUSES = {"ready", "changed", "missing", "unsafe", "unreadable"}
+COMPARED_FIELDS = ("name", "bytes", "sha256", "tags", "status")
+
+
 class DocumentRoom:
     def __init__(self, root, index):
         self.root = Path(root).resolve()
@@ -155,6 +159,76 @@ class DocumentRoom:
                 "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
                 "documents": documents}
 
+    @staticmethod
+    def _validate_manifest(manifest):
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must be a JSON object")
+        release = manifest.get("release")
+        if not isinstance(release, str) or not release.strip():
+            raise ValueError("manifest release must be a non-blank string")
+        if not isinstance(manifest.get("complete"), bool):
+            raise ValueError("manifest complete must be a boolean")
+        documents = manifest.get("documents")
+        if not isinstance(documents, list):
+            raise ValueError("manifest documents must be an array")
+        seen = set()
+        for document in documents:
+            if not isinstance(document, dict):
+                raise ValueError("manifest document must be a JSON object")
+            path = document.get("path")
+            if not isinstance(path, str):
+                raise ValueError("document path must be a string")
+            if (not isinstance(document.get("name"), str)
+                    or not isinstance(document.get("sha256"), str)):
+                raise ValueError("document name and sha256 must be strings")
+            bytes_value = document.get("bytes")
+            if not isinstance(bytes_value, int) or isinstance(bytes_value, bool):
+                raise ValueError("document bytes must be a non-boolean integer")
+            tags = document.get("tags")
+            if (not isinstance(tags, list)
+                    or not all(isinstance(tag, str) for tag in tags)):
+                raise ValueError("document tags must be an array of strings")
+            if document.get("status") not in DOCUMENT_STATUSES:
+                raise ValueError("document status must be one of "
+                                 + ", ".join(sorted(DOCUMENT_STATUSES)))
+            if path in seen:
+                raise ValueError(f"duplicate document path: {path}")
+            seen.add(path)
+        return documents
+
+    @staticmethod
+    def compare_manifests(before, after):
+        before_documents = DocumentRoom._validate_manifest(before)
+        after_documents = DocumentRoom._validate_manifest(after)
+        before_by_path = {document["path"]: document for document in before_documents}
+        after_by_path = {document["path"]: document for document in after_documents}
+        before_paths = set(before_by_path)
+        after_paths = set(after_by_path)
+        added = [after_by_path[path] for path in sorted(after_paths - before_paths)]
+        removed = [before_by_path[path] for path in sorted(before_paths - after_paths)]
+        changed = []
+        unchanged = []
+        for path in sorted(before_paths & after_paths):
+            old = before_by_path[path]
+            new = after_by_path[path]
+            fields = []
+            for field in COMPARED_FIELDS:
+                if field == "tags":
+                    differs = set(old["tags"]) != set(new["tags"])
+                else:
+                    differs = old[field] != new[field]
+                if differs:
+                    fields.append(field)
+            if fields:
+                changed.append({"path": path, "before": old, "after": new,
+                                "fields": sorted(fields)})
+            else:
+                unchanged.append(path)
+        return {"before": {"release": before["release"], "complete": before["complete"]},
+                "after": {"release": after["release"], "complete": after["complete"]},
+                "added": added, "removed": removed,
+                "changed": changed, "unchanged": unchanged}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -178,20 +252,28 @@ def main():
     export.add_argument("--tag", action="append", default=[])
     export.add_argument("--text", default="")
     export.add_argument("--with-references", action="store_true")
+    compare = commands.add_parser("compare")
+    compare.add_argument("--before", required=True)
+    compare.add_argument("--after", required=True)
     args = parser.parse_args()
     try:
-        room = DocumentRoom(args.root, args.index)
-        if args.command == "add":
-            result = room.add(args.path, args.tag)
-        elif args.command == "search":
-            result = room.search(args.tag, args.text)
-        elif args.command == "refs":
-            result = room.set_references(args.path, args.to)
-        elif args.command == "impact":
-            result = room.reference_impact(args.path, transitive=args.transitive)
+        if args.command == "compare":
+            before = json.loads(Path(args.before).read_text(encoding="utf-8"))
+            after = json.loads(Path(args.after).read_text(encoding="utf-8"))
+            result = DocumentRoom.compare_manifests(before, after)
         else:
-            result = room.export_manifest(args.release, args.tag, args.text,
-                                          include_references=args.with_references)
+            room = DocumentRoom(args.root, args.index)
+            if args.command == "add":
+                result = room.add(args.path, args.tag)
+            elif args.command == "search":
+                result = room.search(args.tag, args.text)
+            elif args.command == "refs":
+                result = room.set_references(args.path, args.to)
+            elif args.command == "impact":
+                result = room.reference_impact(args.path, transitive=args.transitive)
+            else:
+                result = room.export_manifest(args.release, args.tag, args.text,
+                                              include_references=args.with_references)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:
