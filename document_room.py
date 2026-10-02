@@ -143,6 +143,62 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    @staticmethod
+    def _validate_importable(records):
+        # Per-record field and type checks shared by the stored index and an
+        # import batch; reference targets are resolved separately, against the
+        # merged index.
+        for key, record in records.items():
+            if (not isinstance(key, str) or not isinstance(record, dict)
+                    or record.get("path") != key):
+                raise ValueError("records must be objects keyed by their path")
+            if (not isinstance(record.get("name"), str)
+                    or not isinstance(record.get("bytes"), int)
+                    or isinstance(record.get("bytes"), bool)
+                    or not isinstance(record.get("sha256"), str)
+                    or not isinstance(record.get("tags"), list)
+                    or not all(isinstance(tag, str) for tag in record["tags"])):
+                raise ValueError("record has invalid field types")
+            if "archived" in record and not isinstance(record["archived"], bool):
+                raise ValueError("record archived must be a boolean")
+            references = record.get("references", [])
+            if (not isinstance(references, list)
+                    or not all(isinstance(target, str) for target in references)):
+                raise ValueError("record references must be a list of strings")
+            if "category" in record and not isinstance(record["category"], str):
+                raise ValueError("record category must be a string")
+
+    def import_records(self, batch):
+        if not isinstance(batch, dict):
+            raise ValueError("import batch must be an object of records")
+        existing = self._load()
+        if not isinstance(existing, dict):
+            raise ValueError("index must be a JSON object of records")
+        # Bad records fail the whole batch even when their paths are not imported.
+        self._validate_importable(existing)
+        self._validate_importable(batch)
+        added = []
+        unchanged = []
+        for key, record in batch.items():
+            if key not in existing:
+                added.append(key)
+            elif existing[key] == record:  # field set and values, arrays ordered
+                unchanged.append(key)
+            else:
+                raise ValueError("import conflicts with the existing record: " + key)
+        merged = dict(existing)
+        for key in added:
+            merged[key] = batch[key]
+        for record in merged.values():
+            for target in record.get("references", []):
+                if target not in merged:
+                    raise ValueError("record references an unregistered path")
+        if added:
+            self.index.parent.mkdir(parents=True, exist_ok=True)
+            self.index.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+        return {"added": sorted(added), "unchanged": sorted(unchanged)}
+
     def reference_impact(self, target, transitive=False):
         if not isinstance(target, str):
             raise ValueError("target path must be a string")
@@ -427,6 +483,8 @@ def main():
     compare = commands.add_parser("compare")
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
+    importer = commands.add_parser("import")
+    importer.add_argument("--from", dest="from_path", required=True)
     args = parser.parse_args()
     try:
         room = DocumentRoom(args.root, args.index)
@@ -446,6 +504,15 @@ def main():
             result = room.find_duplicates(args.tag, args.text)
         elif args.command == "compare":
             result = room.compare_manifest_files(args.before, args.after)
+        elif args.command == "import":
+            try:
+                with open(args.from_path, encoding="utf-8") as handle:
+                    batch = json.load(handle)
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"import file is not valid UTF-8: {exc}")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"import file is not valid JSON: {exc}")
+            result = room.import_records(batch)
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references,

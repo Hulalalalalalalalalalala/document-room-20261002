@@ -918,6 +918,224 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertIn("error", json.loads(result.stdout))
 
 
+class ImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def record(self, path, **overrides):
+        record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                  "sha256": "hash-" + path, "tags": ["legal"]}
+        record.update(overrides)
+        return record
+
+    def test_import_registers_verbatim_without_files(self):
+        batch = {"policy.md": self.record("policy.md", tags=[" Legal ", "POLICY"],
+                                          references=["meeting.txt"],
+                                          extra={"nested": [1, 2]}),
+                 "meeting.txt": self.record("meeting.txt", tags=[],
+                                            category=" Ops ", archived=True)}
+        result = self.room.import_records(batch)
+        self.assertEqual(result, {"added": ["meeting.txt", "policy.md"], "unchanged": []})
+        # Records are stored as given: no path, tag or category normalization,
+        # no optional fields added, extra fields preserved.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored, batch)
+        # No document file exists, yet search returns the full records.
+        self.assertEqual(self.room.search(), [batch["meeting.txt"], batch["policy.md"]])
+        # Tags were stored verbatim, so the normalized query tag matches nothing.
+        self.assertEqual(self.room.search(["legal"]), [])
+        self.assertEqual(self.room.search(text="MEETING"), [batch["meeting.txt"]])
+        # Export expands the forward reference and reports both files missing.
+        manifest = self.room.export_manifest("R1", text="policy",
+                                             include_references=True, include_origins=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertEqual({d["path"]: d["status"] for d in manifest["documents"]},
+                         {"meeting.txt": "missing", "policy.md": "changed"})
+        self.assertFalse(manifest["complete"])
+        origins = {d["path"]: d["origins"] for d in manifest["documents"]}
+        self.assertEqual(origins["meeting.txt"],
+                         [{"path": "policy.md", "distance": 1}])
+        self.assertEqual(origins["policy.md"], [{"path": "policy.md", "distance": 0}])
+
+    def test_import_merges_with_existing_index(self):
+        self.room.add("policy.md", ["legal"])
+        existing = json.loads(self.index.read_text(encoding="utf-8"))
+        batch = {"meeting.txt": self.record("meeting.txt", references=["policy.md"])}
+        result = self.room.import_records(batch)
+        self.assertEqual(result, {"added": ["meeting.txt"], "unchanged": []})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"], existing["policy.md"])
+        self.assertEqual(stored["meeting.txt"], batch["meeting.txt"])
+
+    def test_identical_reimport_is_unchanged_and_not_rewritten(self):
+        batch = {"b.md": self.record("b.md"), "a.md": self.record("a.md")}
+        self.assertEqual(self.room.import_records(batch)["added"], ["a.md", "b.md"])
+        before = self.index.read_text(encoding="utf-8")
+        # Object key order does not participate in the comparison.
+        shuffled = {path: dict(reversed(list(record.items())))
+                    for path, record in batch.items()}
+        result = self.room.import_records(shuffled)
+        self.assertEqual(result, {"added": [], "unchanged": ["a.md", "b.md"]})
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_empty_batch_and_missing_index_create_nothing(self):
+        self.assertEqual(self.room.import_records({}), {"added": [], "unchanged": []})
+        self.assertFalse(self.index.exists())
+        self.assertFalse((self.root / "nested").exists())
+        nested = DocumentRoom(self.root, self.root / "nested" / "index.json")
+        self.assertEqual(nested.import_records({}), {"added": [], "unchanged": []})
+        self.assertFalse((self.root / "nested").exists())
+
+    def test_conflict_raises_and_leaves_index_untouched(self):
+        self.room.import_records({"policy.md": self.record("policy.md")})
+        before = self.index.read_text(encoding="utf-8")
+        conflicting = {"policy.md": self.record("policy.md", bytes=11),
+                       "new.md": self.record("new.md")}
+        with self.assertRaises(ValueError):
+            self.room.import_records(conflicting)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_duplicate_judgement_field_set_and_array_order(self):
+        self.room.import_records({"a.md": self.record("a.md", tags=["x", "y"]),
+                                  "b.md": self.record("b.md")})
+        before = self.index.read_text(encoding="utf-8")
+        # Array order participates in the comparison.
+        with self.assertRaises(ValueError):
+            self.room.import_records({"a.md": self.record("a.md", tags=["y", "x"])})
+        # A missing optional field differs from its explicit default.
+        with self.assertRaises(ValueError):
+            self.room.import_records({"b.md": self.record("b.md", archived=False)})
+        with self.assertRaises(ValueError):
+            self.room.import_records({"b.md": self.record("b.md", references=[])})
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # An explicitly stored default matches only the same explicit default.
+        self.room.import_records({"c.md": self.record("c.md", archived=False)})
+        result = self.room.import_records({"c.md": self.record("c.md", archived=False)})
+        self.assertEqual(result["unchanged"], ["c.md"])
+
+    def test_invalid_batch_raises_and_creates_nothing(self):
+        good = self.record("ok.md")
+        bad_batches = [
+            [good],  # not an object
+            {"ok.md": ["not", "a", "record"]},
+            {"ok.md": self.record("other.md")},  # key/path mismatch
+            {"ok.md": self.record("ok.md", name=1)},
+            {"ok.md": self.record("ok.md", bytes=True)},
+            {"ok.md": self.record("ok.md", bytes="10")},
+            {"ok.md": self.record("ok.md", sha256=5)},
+            {"ok.md": self.record("ok.md", tags="legal")},
+            {"ok.md": self.record("ok.md", tags=["legal", 2])},
+            {"ok.md": self.record("ok.md", archived="yes")},
+            {"ok.md": self.record("ok.md", references="meeting.txt")},
+            {"ok.md": self.record("ok.md", references=[1])},
+            {"ok.md": self.record("ok.md", category=7)},
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.room.import_records(batch)
+        with self.assertRaises(ValueError):
+            self.room.import_records(["not", "a", "dict"])
+        self.assertFalse(self.index.exists())
+
+    def test_unregistered_reference_fails_whole_batch(self):
+        batch = {"a.md": self.record("a.md", references=["ghost.md"]),
+                 "b.md": self.record("b.md")}
+        with self.assertRaises(ValueError):
+            self.room.import_records(batch)
+        self.assertFalse(self.index.exists())
+
+    def test_forward_self_and_cyclic_references_allowed(self):
+        batch = {"policy.md": self.record("policy.md", references=["meeting.txt"]),
+                 "meeting.txt": self.record("meeting.txt",
+                                            references=["policy.md", "meeting.txt"])}
+        result = self.room.import_records(batch)
+        self.assertEqual(result["added"], ["meeting.txt", "policy.md"])
+        impact = self.room.reference_impact("meeting.txt", transitive=True)
+        self.assertEqual([d["path"] for d in impact["documents"]], ["policy.md"])
+
+    def test_reference_may_point_at_existing_record(self):
+        self.room.add("policy.md")
+        result = self.room.import_records(
+            {"meeting.txt": self.record("meeting.txt", references=["policy.md"])})
+        self.assertEqual(result["added"], ["meeting.txt"])
+
+    def test_bad_existing_index_record_fails_import(self):
+        self.room.add("policy.md")
+        records = json.loads(self.index.read_text(encoding="utf-8"))
+        records["junk.md"] = {"path": "junk.md", "name": "junk.md", "bytes": True,
+                              "sha256": "x", "tags": []}
+        self.index.write_text(json.dumps(records), encoding="utf-8")
+        before = self.index.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.import_records({"new.md": self.record("new.md")})
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # A stored reference the batch would satisfy is resolved against the union.
+        records["junk.md"] = self.record("junk.md", references=["new.md"])
+        self.index.write_text(json.dumps(records), encoding="utf-8")
+        result = self.room.import_records({"new.md": self.record("new.md")})
+        self.assertEqual(result["added"], ["new.md"])
+
+    def test_corrupt_index_and_read_failure(self):
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.import_records({"a.md": self.record("a.md")})
+        self.index.write_text(json.dumps([1, 2]), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.import_records({"a.md": self.record("a.md")})
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.import_records({"a.md": self.record("a.md")})
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_cli_import_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        batch_path = self.root / "batch.json"
+        batch = {"meeting.txt": self.record("meeting.txt"),
+                 "policy.md": self.record("policy.md", references=["meeting.txt"])}
+        batch_path.write_text(json.dumps(batch), encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--from", str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"added": ["meeting.txt", "policy.md"], "unchanged": []})
+        self.assertEqual(json.loads(batch_path.read_text(encoding="utf-8")), batch)
+        # A conflicting second import is a JSON error with exit 2.
+        batch["policy.md"]["bytes"] = 999
+        batch_path.write_text(json.dumps(batch), encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--from", str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # Invalid JSON, invalid UTF-8 and a missing source file all exit 2.
+        batch_path.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--from", str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        batch_path.write_bytes(b"\xff\xfe{}")
+        result = subprocess.run(prefix + ["import", "--from", str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        result = subprocess.run(
+            prefix + ["import", "--from", str(self.root / "missing.json")],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # The failed imports never altered the index from the first success.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["bytes"], 10)
+
+
 class ManifestComparisonTests(unittest.TestCase):
     def doc(self, path, **overrides):
         document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
