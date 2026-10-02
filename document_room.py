@@ -117,6 +117,36 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    def remove_record(self, relative_path, detach=False):
+        if not isinstance(relative_path, str):
+            raise ValueError("document path must be a string")
+        if not isinstance(detach, bool):
+            raise ValueError("detach must be a boolean")
+        records = self._load_validated_with_categories()
+        if relative_path not in records:
+            raise ValueError("document is not registered")
+        # Only other records' references block removal; the target's own
+        # self-reference does not.
+        referrers = [key for key, record in records.items()
+                     if key != relative_path
+                     and relative_path in record.get("references", [])]
+        if not detach and referrers:
+            raise ValueError("document is referenced by another record")
+        updated = []
+        for key in referrers:
+            record = records[key]
+            # Keep the order and any duplicates among the remaining references;
+            # records without a references field never reach this list.
+            record["references"] = [target for target in record["references"]
+                                     if target != relative_path]
+            updated.append(record)
+        removed = records[relative_path]
+        del records[relative_path]
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+        return {"removed": removed,
+                "updated": sorted(updated, key=lambda record: record["path"])}
+
     def set_archived(self, relative_path, archived):
         if not isinstance(relative_path, str):
             raise ValueError("document path must be a string")
@@ -488,6 +518,9 @@ def main():
     archive = commands.add_parser("archive")
     archive.add_argument("path")
     archive.add_argument("--restore", action="store_true")
+    remove = commands.add_parser("remove")
+    remove.add_argument("path")
+    remove.add_argument("--detach", action="store_true")
     category = commands.add_parser("category")
     category.add_argument("path")
     category.add_argument("--value", required=True)
@@ -525,6 +558,8 @@ def main():
             result = room.add(args.path, args.tag)
         elif args.command == "archive":
             result = room.set_archived(args.path, not args.restore)
+        elif args.command == "remove":
+            result = room.remove_record(args.path, detach=args.detach)
         elif args.command == "category":
             result = room.set_category(args.path, args.value)
         elif args.command == "search":
