@@ -143,6 +143,32 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    def remove_record(self, relative_path, detach=False):
+        if not isinstance(relative_path, str):
+            raise ValueError("document path must be a string")
+        if not isinstance(detach, bool):
+            raise ValueError("detach must be a boolean")
+        records = self._load_validated_with_categories()
+        if relative_path not in records:
+            raise ValueError("document is not registered")
+        removed = records[relative_path]
+        updated = []
+        for source, record in records.items():
+            if source == relative_path or "references" not in record:
+                continue
+            remaining = [target for target in record["references"]
+                         if target != relative_path]
+            # The target's own references never block its removal.
+            if len(remaining) != len(record["references"]):
+                if not detach:
+                    raise ValueError("document is referenced by another record")
+                record["references"] = remaining
+                updated.append(record)
+        del records[relative_path]
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return {"removed": removed,
+                "updated": sorted(updated, key=lambda record: record["path"])}
+
     @staticmethod
     def _validate_importable(records):
         # Per-record field and type checks shared by the stored index and an
@@ -491,6 +517,9 @@ def main():
     category = commands.add_parser("category")
     category.add_argument("path")
     category.add_argument("--value", required=True)
+    remove = commands.add_parser("remove")
+    remove.add_argument("path")
+    remove.add_argument("--detach", action="store_true")
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
@@ -527,6 +556,8 @@ def main():
             result = room.set_archived(args.path, not args.restore)
         elif args.command == "category":
             result = room.set_category(args.path, args.value)
+        elif args.command == "remove":
+            result = room.remove_record(args.path, detach=args.detach)
         elif args.command == "search":
             result = room.search(args.tag, args.text, args.archive_state, args.category)
         elif args.command == "refs":

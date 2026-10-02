@@ -918,6 +918,220 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertIn("error", json.loads(result.stdout))
 
 
+class RemoveTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def record(self, path, **overrides):
+        record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                  "sha256": "hash-" + path, "tags": ["legal"]}
+        record.update(overrides)
+        return record
+
+    def _register_pair(self):
+        policy = self.room.add("policy.md", ["legal"])
+        meeting = self.room.add("meeting.txt", ["operations"])
+        self.room.set_references("policy.md", ["meeting.txt"])
+        return policy, meeting
+
+    def test_remove_blocked_while_referenced_leaves_everything_untouched(self):
+        _, meeting = self._register_pair()
+        before = self.index.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_record("meeting.txt")
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["meeting.txt"], meeting)
+        self.assertEqual(stored["policy.md"]["references"], ["meeting.txt"])
+
+    def test_outgoing_and_self_references_do_not_block(self):
+        policy, meeting = self._register_pair()
+        # Nobody references policy.md, so its own outgoing reference is fine.
+        policy = json.loads(self.index.read_text(encoding="utf-8"))["policy.md"]
+        result = self.room.remove_record("policy.md")
+        self.assertEqual(result["removed"], policy)
+        self.assertEqual(result["updated"], [])
+        self.assertEqual([r["path"] for r in self.room.search()], ["meeting.txt"])
+        # A self-reference never blocks the target's own removal.
+        self.room.set_references("meeting.txt", ["meeting.txt"])
+        result = self.room.remove_record("meeting.txt")
+        self.assertEqual(result["removed"]["references"], ["meeting.txt"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(self.room.search(), [])
+
+    def test_detach_clears_references_removes_target_and_keeps_file(self):
+        _, meeting = self._register_pair()
+        result = self.room.remove_record("meeting.txt", detach=True)
+        self.assertEqual(result["removed"], meeting)
+        self.assertEqual([r["path"] for r in result["updated"]], ["policy.md"])
+        self.assertEqual(result["updated"][0]["references"], [])
+        # The emptied field is retained, the target key is gone.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("meeting.txt", stored)
+        self.assertEqual(stored["policy.md"]["references"], [])
+        # The document file itself is never deleted, moved or read for removal.
+        self.assertTrue((self.root / "meeting.txt").is_file())
+
+    def test_detach_preserves_order_duplicates_empty_list_and_fields(self):
+        batch = {
+            "meeting.txt": self.record("meeting.txt"),
+            "a.md": self.record("a.md", references=["meeting.txt", "c.md", "meeting.txt", "c.md"],
+                                extra={"keep": [1, 2]}),
+            "B.md": self.record("B.md", references=["meeting.txt", "meeting.txt"]),
+            "d.md": self.record("d.md", category="Docs"),
+            "c.md": self.record("c.md"),
+        }
+        self.room.import_records(batch)
+        result = self.room.remove_record("meeting.txt", detach=True)
+        self.assertEqual(result["removed"], batch["meeting.txt"])
+        # Updated records are full records sorted by case-sensitive path order.
+        self.assertEqual([r["path"] for r in result["updated"]], ["B.md", "a.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"a.md", "B.md", "c.md", "d.md"})
+        # Surviving references keep their order; duplicates of other targets stay.
+        self.assertEqual(stored["a.md"]["references"], ["c.md", "c.md"])
+        self.assertEqual(stored["a.md"]["extra"], {"keep": [1, 2]})
+        # Cleared references remain an explicit empty list.
+        self.assertEqual(stored["B.md"]["references"], [])
+        # Records without a references field do not gain one and are not listed.
+        self.assertNotIn("references", stored["d.md"])
+        self.assertEqual(stored["d.md"]["category"], "Docs")
+        self.assertFalse(any(r["path"] == "d.md" for r in result["updated"]))
+        # Unaffected referrers of other targets keep their arrays verbatim.
+        self.assertEqual(stored["c.md"], batch["c.md"])
+
+    def test_detach_does_not_recurse_along_reference_edges(self):
+        batch = {"a.md": self.record("a.md", references=["b.md"]),
+                 "b.md": self.record("b.md", references=["c.md"]),
+                 "c.md": self.record("c.md")}
+        self.room.import_records(batch)
+        result = self.room.remove_record("b.md", detach=True)
+        self.assertEqual([r["path"] for r in result["updated"]], ["a.md"])
+        # Only b.md leaves: c.md is not recursively removed, a.md stays.
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))),
+                         {"a.md", "c.md"})
+
+    def test_remove_works_after_original_file_deleted(self):
+        _, meeting = self._register_pair()
+        (self.root / "meeting.txt").unlink()
+        result = self.room.remove_record("meeting.txt", detach=True)
+        self.assertEqual(result["removed"], meeting)
+        self.assertFalse((self.root / "meeting.txt").exists())
+        self.assertNotIn("meeting.txt", json.loads(self.index.read_text(encoding="utf-8")))
+
+    def test_remove_without_index_raises_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.remove_record("meeting.txt")
+        with self.assertRaises(ValueError):
+            fresh.remove_record("meeting.txt", detach=True)
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_remove_validation_leaves_index_untouched(self):
+        self._register_pair()
+        before = self.index.read_text(encoding="utf-8")
+        for args in ((None,), (7, []), ("meeting.txt", "yes"),
+                     ("meeting.txt", 1), ("meeting.txt", None),
+                     ("ghost.md",), ("MEETING.TXT",)):
+            with self.assertRaises(ValueError, msg=repr(args)):
+                self.room.remove_record(*args)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_remove_validates_whole_index_before_changes(self):
+        self._register_pair()
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_record("meeting.txt", detach=True)
+        # A dangling reference on an unrelated record invalidates the removal.
+        stored = json.loads(valid)
+        stored["policy.md"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_record("meeting.txt", detach=True)
+        # A malformed field on an unrelated record does too.
+        stored = json.loads(valid)
+        stored["policy.md"]["bytes"] = "10"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_record("meeting.txt", detach=True)
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.remove_record("meeting.txt", detach=True)
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.remove_record("meeting.txt", detach=True)
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_queries_and_exports_after_detach_use_remaining_records(self):
+        self._register_pair()
+        self.room.remove_record("meeting.txt", detach=True)
+        self.assertEqual([r["path"] for r in self.room.search()], ["policy.md"])
+        # Reference expansion cannot reach the removed record anymore.
+        self.assertEqual(sorted(self.room.export_records(tags=["legal"])), ["policy.md"])
+        manifest = self.room.export_manifest("R1", include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]], ["policy.md"])
+        self.assertTrue(manifest["complete"])
+        # The removed path is now an unknown impact target.
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt")
+
+    def test_cli_remove_blocked_then_detach_scenario(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        # Offline scenario: only policy.md and meeting.txt registered, policy
+        # references meeting.
+        subprocess.run(prefix + ["add", "policy.md", "--tag", "legal"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "meeting.txt", "--tag", "operations"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["refs", "policy.md", "--to", "meeting.txt"],
+                       capture_output=True, check=True)
+        # Default removal of the referenced document is blocked with exit 2.
+        blocked = subprocess.run(prefix + ["remove", "meeting.txt"],
+                                 capture_output=True, text=True)
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("error", json.loads(blocked.stdout))
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertIn("meeting.txt", stored)
+        # Detach mode succeeds with the {removed, updated} payload.
+        result = subprocess.run(prefix + ["remove", "meeting.txt", "--detach"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["removed"]["path"], "meeting.txt")
+        self.assertEqual([r["path"] for r in payload["updated"]], ["policy.md"])
+        self.assertEqual(payload["updated"][0]["references"], [])
+        # The original file is untouched, and reference expansion lists policy only.
+        self.assertTrue((self.root / "meeting.txt").is_file())
+        dumped = subprocess.run(prefix + ["dump", "--tag", "legal"],
+                                capture_output=True, text=True)
+        self.assertEqual(dumped.returncode, 0, dumped.stderr)
+        self.assertEqual(sorted(json.loads(dumped.stdout)), ["policy.md"])
+        # Removing the same path again fails as unregistered with exit 2.
+        again = subprocess.run(prefix + ["remove", "meeting.txt", "--detach"],
+                               capture_output=True, text=True)
+        self.assertEqual(again.returncode, 2)
+        self.assertIn("error", json.loads(again.stdout))
+        # A missing index reports the path unregistered and creates nothing.
+        missing = [sys.executable, str(ROOT / "document_room.py"),
+                   "--root", str(self.root), "--index", str(self.root / "fresh.json")]
+        result = subprocess.run(missing + ["remove", "meeting.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        self.assertFalse((self.root / "fresh.json").exists())
+
+
 class ImportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
