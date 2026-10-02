@@ -315,6 +315,180 @@ class DocumentRoomTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("error", json.loads(result.stdout))
 
+    def _add_notes(self):
+        (self.root / "notes.md").write_text("More notes\n", encoding="utf-8")
+        return self.room.add("notes.md", ["notes"])
+
+    def test_reference_impact_direct_and_transitive_chain(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self._add_notes()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_references("meeting.txt", ["notes.md"])
+        direct = self.room.reference_impact("notes.md")
+        self.assertEqual(direct["path"], "notes.md")
+        self.assertEqual([(d["path"], d["distance"]) for d in direct["documents"]],
+                         [("meeting.txt", 1)])
+        transitively = self.room.reference_impact("notes.md", transitive=True)
+        self.assertEqual([(d["path"], d["distance"]) for d in transitively["documents"]],
+                         [("meeting.txt", 1), ("policy.md", 2)])
+
+    def test_reference_impact_defaults_to_direct_only(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        result = self.room.reference_impact("meeting.txt")
+        self.assertEqual([d["path"] for d in result["documents"]], ["policy.md"])
+        self.assertEqual(result["documents"][0]["distance"], 1)
+
+    def test_reference_impact_excludes_target_and_ends_on_cycles(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self._add_notes()
+        self.room.set_references("policy.md", ["meeting.txt", "policy.md"])
+        self.room.set_references("meeting.txt", ["policy.md", "notes.md"])
+        self.room.set_references("notes.md", ["notes.md"])
+        result = self.room.reference_impact("notes.md", transitive=True)
+        paths = [d["path"] for d in result["documents"]]
+        self.assertEqual(paths, ["meeting.txt", "policy.md"])
+        self.assertNotIn("notes.md", paths)
+        distances = {d["path"]: d["distance"] for d in result["documents"]}
+        self.assertEqual(distances, {"meeting.txt": 1, "policy.md": 2})
+        # A self-reference alone never lists the target itself.
+        only_self = self.room.reference_impact("policy.md", transitive=True)
+        self.assertEqual([d["path"] for d in only_self["documents"]], ["meeting.txt"])
+
+    def test_reference_impact_unreferenced_target_is_empty(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self.room.set_references("meeting.txt", ["meeting.txt"])
+        result = self.room.reference_impact("policy.md")
+        self.assertEqual(result, {"path": "policy.md", "documents": []})
+
+    def test_reference_impact_sorting_and_record_shape(self):
+        (self.root / "a.md").write_text("a\n", encoding="utf-8")
+        (self.root / "b.md").write_text("b\n", encoding="utf-8")
+        self.room.add("a.md", ["x"])
+        self.room.add("b.md", ["y"])
+        self.room.add("policy.md")
+        self.room.set_references("a.md", ["policy.md"])
+        self.room.set_references("b.md", ["a.md", "policy.md"])
+        result = self.room.reference_impact("policy.md", transitive=True)
+        self.assertEqual([d["path"] for d in result["documents"]], ["a.md", "b.md"])
+        # Records match search output, plus an integer distance.
+        search_record = {record["path"]: record for record in self.room.search()}
+        for document in result["documents"]:
+            path = document["path"]
+            for key, value in search_record[path].items():
+                self.assertEqual(document[key], value)
+            self.assertIsInstance(document["distance"], int)
+            self.assertNotIsInstance(document["distance"], bool)
+
+    def test_reference_impact_ignores_live_file_state(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        before = self.index.read_text(encoding="utf-8")
+        (self.root / "meeting.txt").write_text("changed body", encoding="utf-8")
+        (self.root / "policy.md").unlink()
+        result = self.room.reference_impact("meeting.txt", True)
+        self.assertEqual([(d["path"], d["distance"]) for d in result["documents"]],
+                         [("policy.md", 1)])
+        # The query never writes the index.
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_reference_impact_validation(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        for bad_target in (None, 7, ["policy.md"]):
+            with self.assertRaises(ValueError, msg=repr(bad_target)):
+                self.room.reference_impact(bad_target)
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("ghost.md")
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("POLICY.MD")
+        for bad_flag in ("true", 1, 0, None):
+            with self.assertRaises(ValueError, msg=repr(bad_flag)):
+                self.room.reference_impact("policy.md", bad_flag)
+
+    def test_reference_impact_missing_index_raises_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.reference_impact("policy.md")
+        with self.assertRaises(ValueError):
+            fresh.reference_impact("policy.md", True)
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_reference_impact_rejects_corrupt_index_even_unrelated(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self._add_notes()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        valid = json.loads(self.index.read_text(encoding="utf-8"))
+
+        def reject(payload):
+            self.index.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.room.reference_impact("policy.md")
+            with self.assertRaises(ValueError):
+                self.room.reference_impact("policy.md", True)
+
+        bad = json.loads(json.dumps(valid))
+        bad["notes.md"]["references"] = "meeting.txt"
+        reject(bad)
+        bad = json.loads(json.dumps(valid))
+        bad["notes.md"]["references"] = ["ghost.txt"]
+        reject(bad)
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.reference_impact("meeting.txt")
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_reference_impact_old_records_without_references(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        # An old-style index with no references field is valid and means none.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("references", stored["policy.md"])
+        result = self.room.reference_impact("meeting.txt", True)
+        self.assertEqual(result["documents"], [])
+        self.assertNotIn("references", json.loads(self.index.read_text(encoding="utf-8"))["policy.md"])
+
+    def test_cli_impact_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self._add_notes()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_references("meeting.txt", ["notes.md"])
+        result = subprocess.run(prefix + ["impact", "notes.md"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        direct = json.loads(result.stdout)
+        self.assertEqual(direct["path"], "notes.md")
+        self.assertEqual([d["path"] for d in direct["documents"]], ["meeting.txt"])
+        result = subprocess.run(prefix + ["impact", "notes.md", "--transitive"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        transitively = json.loads(result.stdout)
+        self.assertEqual([(d["path"], d["distance"]) for d in transitively["documents"]],
+                         [("meeting.txt", 1), ("policy.md", 2)])
+        result = subprocess.run(prefix + ["impact", "policy.md"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["documents"], [])
+        for bad in ("ghost.md", "POLICY.MD"):
+            result = subprocess.run(prefix + ["impact", bad], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+        # The impact command never writes the index.
+        stored = self.index.read_text(encoding="utf-8")
+        subprocess.run(prefix + ["impact", "notes.md", "--transitive"], capture_output=True)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), stored)
+
 
 if __name__ == "__main__":
     unittest.main()
