@@ -228,11 +228,15 @@ class DocumentRoom:
             return "unreadable"
 
     def export_manifest(self, release, tags=(), text="", include_references=False,
-                        archive_state="all", category=None):
+                        archive_state="all", category=None, include_origins=False):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
         self._check_archive_state(archive_state)
         self._check_category_filter(category)
+        if not isinstance(include_origins, bool):
+            raise ValueError("include_origins must be a boolean")
+        if include_origins and not include_references:
+            raise ValueError("include_origins requires include_references")
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
 
@@ -248,7 +252,8 @@ class DocumentRoom:
             records = self._load_validated()
         if include_references:
             selected = {}
-            stack = [key for key, record in records.items() if matches(record)]
+            starts = [key for key, record in records.items() if matches(record)]
+            stack = list(starts)
             while stack:
                 key = stack.pop()
                 if key in selected:
@@ -258,13 +263,40 @@ class DocumentRoom:
                 # or category.
                 stack.extend(records[key].get("references", []))
             ordered = [selected[key] for key in sorted(selected)]
+            origins = {}
+            if include_origins:
+                # Breadth-first from each starting document along the reference
+                # direction; every reachable document keeps the shortest distance
+                # per starting source.
+                for start in starts:
+                    distances = {start: 0}
+                    frontier = [start]
+                    depth = 0
+                    while frontier:
+                        nxt = []
+                        for node in frontier:
+                            for target in records[node].get("references", []):
+                                if target not in distances:
+                                    distances[target] = depth + 1
+                                    nxt.append(target)
+                        frontier = nxt
+                        depth += 1
+                    for key, distance in distances.items():
+                        per_document = origins.setdefault(key, {})
+                        if start not in per_document or distance < per_document[start]:
+                            per_document[start] = distance
         else:
             ordered = [record for _, record in sorted(records.items()) if matches(record)]
         documents = []
         for record in ordered:
-            documents.append({"path": record["path"], "name": record["name"],
-                              "bytes": record["bytes"], "sha256": record["sha256"],
-                              "tags": record["tags"], "status": self._file_status(record)})
+            document = {"path": record["path"], "name": record["name"],
+                        "bytes": record["bytes"], "sha256": record["sha256"],
+                        "tags": record["tags"], "status": self._file_status(record)}
+            if include_origins:
+                document["origins"] = [
+                    {"path": source, "distance": origins[record["path"]][source]}
+                    for source in sorted(origins[record["path"]])]
+            documents.append(document)
         return {"release": release,
                 "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
                 "documents": documents}
@@ -389,6 +421,7 @@ def main():
     export.add_argument("--tag", action="append", default=[])
     export.add_argument("--text", default="")
     export.add_argument("--with-references", action="store_true")
+    export.add_argument("--with-origins", action="store_true")
     export.add_argument("--archive-state", default="all")
     export.add_argument("--category", default=None)
     compare = commands.add_parser("compare")
@@ -417,7 +450,8 @@ def main():
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references,
                                           archive_state=args.archive_state,
-                                          category=args.category)
+                                          category=args.category,
+                                          include_origins=args.with_origins)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:

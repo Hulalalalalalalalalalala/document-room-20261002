@@ -291,6 +291,122 @@ class DocumentRoomTests(unittest.TestCase):
         manifest = self.room.export_manifest("R1")
         self.assertEqual(len(manifest["documents"]), 2)
 
+    def _add_document(self, name, tags=()):
+        (self.root / name).write_text(f"Content of {name}\n", encoding="utf-8")
+        return self.room.add(name, tags)
+
+    def test_manifest_with_origins_shared_sources_and_distances(self):
+        self._add_document("a.md", ["release"])
+        self._add_document("b.md", ["release"])
+        self._add_document("c.md")
+        self._add_document("d.md")
+        self.room.set_references("a.md", ["c.md"])
+        self.room.set_references("b.md", ["d.md"])
+        self.room.set_references("d.md", ["c.md"])
+        manifest = self.room.export_manifest("R1", ["release"], include_references=True,
+                                             include_origins=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["a.md", "b.md", "c.md", "d.md"])
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["a.md"]["origins"], [{"path": "a.md", "distance": 0}])
+        self.assertEqual(by_path["b.md"]["origins"], [{"path": "b.md", "distance": 0}])
+        # The shared document keeps every starting source at its shortest distance.
+        self.assertEqual(by_path["c.md"]["origins"],
+                         [{"path": "a.md", "distance": 1},
+                          {"path": "b.md", "distance": 2}])
+        self.assertEqual(by_path["d.md"]["origins"], [{"path": "b.md", "distance": 1}])
+        # A back-reference extends the reach of other starting documents.
+        self.room.set_references("c.md", ["a.md"])
+        manifest = self.room.export_manifest("R1", ["release"], include_references=True,
+                                             include_origins=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["a.md"]["origins"],
+                         [{"path": "a.md", "distance": 0},
+                          {"path": "b.md", "distance": 3}])
+        self.assertEqual(by_path["b.md"]["origins"], [{"path": "b.md", "distance": 0}])
+        self.assertEqual(by_path["c.md"]["origins"],
+                         [{"path": "a.md", "distance": 1},
+                          {"path": "b.md", "distance": 2}])
+
+    def test_manifest_with_origins_cycles_and_self_reference(self):
+        self._add_document("a.md", ["release"])
+        self._add_document("b.md")
+        self.room.set_references("a.md", ["a.md", "b.md"])
+        self.room.set_references("b.md", ["a.md"])
+        manifest = self.room.export_manifest("R1", ["release"], include_references=True,
+                                             include_origins=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        # The starting document keeps distance 0 despite its self-reference.
+        self.assertEqual(by_path["a.md"]["origins"], [{"path": "a.md", "distance": 0}])
+        self.assertEqual(by_path["b.md"]["origins"], [{"path": "a.md", "distance": 1}])
+
+    def test_manifest_with_origins_requires_references_and_boolean(self):
+        self._add_document("a.md", ["release"])
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", include_origins=True)
+        for bad in (1, "yes", None):
+            with self.assertRaises(ValueError):
+                self.room.export_manifest("R1", include_references=True,
+                                          include_origins=bad)
+        # Without the new flag the manifest carries no origins.
+        manifest = self.room.export_manifest("R1", ["release"], include_references=True)
+        self.assertNotIn("origins", manifest["documents"][0])
+
+    def test_manifest_with_origins_validates_whole_index(self):
+        self._add_document("a.md", ["release"])
+        self._add_document("b.md")
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        # The corrupt record is not selected, yet origins export still fails.
+        stored["b.md"]["references"] = ["ghost.md"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", ["release"], include_references=True,
+                                      include_origins=True)
+        # An empty selection still yields an empty, incomplete manifest.
+        del stored["b.md"]["references"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        empty = self.room.export_manifest("R1", ["nothing"], include_references=True,
+                                          include_origins=True)
+        self.assertEqual(empty["documents"], [])
+        self.assertFalse(empty["complete"])
+
+    def test_cli_export_with_origins(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
+        self._add_document("a.md", ["release"])
+        self._add_document("b.md")
+        self.room.set_references("a.md", ["b.md"])
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--tag", "release",
+                                          "--with-references", "--with-origins"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["b.md"]["origins"], [{"path": "a.md", "distance": 1}])
+        # Origins without reference expansion is a JSON error with exit 2.
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--with-origins"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+    def test_compare_preserves_origins_without_comparing_them(self):
+        self._add_document("a.md", ["release"])
+        self._add_document("b.md")
+        self.room.set_references("a.md", ["b.md"])
+        before = self.room.export_manifest("R1", ["release"], include_references=True,
+                                           include_origins=True)
+        after = self.room.export_manifest("R1", ["release"], include_references=True,
+                                          include_origins=True)
+        after["documents"][1]["origins"] = [{"path": "b.md", "distance": 0}]
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["unchanged"], ["a.md", "b.md"])
+        # The extra field survives in the returned documents.
+        added = dict(before)
+        added["documents"] = before["documents"] + [dict(after["documents"][1],
+                                                         path="extra.md")]
+        result = DocumentRoom.compare_manifests(before, added)
+        self.assertEqual(result["added"][0]["origins"], [{"path": "b.md", "distance": 0}])
+
     def test_reference_impact_direct_and_transitive_distances(self):
         self.room.add("policy.md", ["legal"])
         self._add_meeting()
