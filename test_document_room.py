@@ -918,6 +918,286 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertIn("error", json.loads(result.stdout))
 
 
+class VersionNoteTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def _register_pair(self):
+        policy = self.room.add("policy.md", ["legal"])
+        meeting = self.room.add("meeting.txt", ["operations"])
+        return policy, meeting
+
+    def test_set_version_note_roundtrip_and_preserves_record(self):
+        self.room.add("policy.md", ["legal"])
+        self._register_pair()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_category("policy.md", "Legal")
+        # Surrounding whitespace (including tabs/newlines) is stripped; inner
+        # whitespace, newlines and case are preserved.
+        note = "  Revision A\n  fixes  Legal  review \t"
+        record = self.room.set_version_note("policy.md", note)
+        self.assertEqual(record["version_note"], "Revision A\n  fixes  Legal  review")
+        # Other metadata, references and category are untouched.
+        self.assertEqual(record["tags"], ["legal"])
+        self.assertEqual(record["references"], ["meeting.txt"])
+        self.assertEqual(record["category"], "Legal")
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["version_note"],
+                         "Revision A\n  fixes  Legal  review")
+        self.assertNotIn("version_note", stored["meeting.txt"])
+        # Setting the same note twice returns the identical record.
+        self.assertEqual(self.room.set_version_note("policy.md", note), record)
+        # An empty or all-whitespace value clears the note, stored explicitly.
+        cleared = self.room.set_version_note("policy.md", "  \n\t ")
+        self.assertEqual(cleared["version_note"], "")
+        self.assertIn("version_note",
+                      json.loads(self.index.read_text(encoding="utf-8"))["policy.md"])
+
+    def test_set_version_note_works_after_file_deleted(self):
+        self.room.add("policy.md", ["legal"])
+        (self.root / "policy.md").unlink()
+        record = self.room.set_version_note("policy.md", "offline note")
+        self.assertEqual(record["version_note"], "offline note")
+
+    def test_set_version_note_without_index_raises_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.set_version_note("policy.md", "note")
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_set_version_note_validation_leaves_index_untouched(self):
+        self.room.add("policy.md")
+        before = self.index.read_text(encoding="utf-8")
+        for args in ((None, "note"), (7, "note"), ("policy.md", None),
+                     ("policy.md", 7), ("policy.md", ["note"]), ("policy.md", True),
+                     ("missing.md", "note"), ("POLICY.MD", "note")):
+            with self.assertRaises(ValueError, msg=repr(args)):
+                self.room.set_version_note(*args)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_set_version_note_validates_whole_index(self):
+        self.room.add("policy.md")
+        self._register_pair()
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_version_note("policy.md", "note")
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.set_version_note("policy.md", "note")
+        # A non-string version_note on another record invalidates the whole index.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["version_note"] = 7
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_version_note("policy.md", "note")
+        # A dangling reference on an unrelated record is also rejected.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_version_note("policy.md", "note")
+        # A malformed field type on an unrelated record is rejected too.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["bytes"] = "10"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_version_note("policy.md", "note")
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.set_version_note("policy.md", "note")
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_add_preserves_version_note(self):
+        first = self.room.add("policy.md", ["legal"])
+        self.assertNotIn("version_note", first)
+        self.room.set_version_note("policy.md", "Keep me\nverbatim")
+        (self.root / "policy.md").write_text("Revised policy\n", encoding="utf-8")
+        again = self.room.add("policy.md", ["updated"])
+        self.assertEqual(again["version_note"], "Keep me\nverbatim")
+        self.assertEqual(again["tags"], ["updated"])
+        self.assertEqual(self.room.search(["updated"])[0]["version_note"],
+                         "Keep me\nverbatim")
+
+    def test_search_and_dump_return_stored_version_note(self):
+        self.room.add("policy.md", ["legal"])
+        self._register_pair()
+        self.room.set_version_note("policy.md", "note one")
+        records = {r["path"]: r for r in self.room.search()}
+        self.assertEqual(records["policy.md"]["version_note"], "note one")
+        self.assertNotIn("version_note", records["meeting.txt"])
+        dumped = self.room.export_records()
+        self.assertEqual(dumped["policy.md"]["version_note"], "note one")
+        self.assertNotIn("version_note", dumped["meeting.txt"])
+
+    def test_export_with_version_notes_adds_field(self):
+        self.room.add("policy.md", ["legal"])
+        self._register_pair()
+        self.room.set_version_note("policy.md", "release note")
+        # Off by default: no field is added and behaviour is unchanged.
+        plain = self.room.export_manifest("R1")
+        self.assertEqual([d["path"] for d in plain["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertTrue(
+            all("version_note" not in d for d in plain["documents"]))
+        # Enabled: every document gains version_note; missing field -> "".
+        manifest = self.room.export_manifest("R1", include_version_notes=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["policy.md"]["version_note"], "release note")
+        self.assertEqual(by_path["meeting.txt"]["version_note"], "")
+        self.assertTrue(manifest["complete"])
+        self.assertEqual(set(by_path["policy.md"]),
+                         {"path", "name", "bytes", "sha256", "tags", "status",
+                          "version_note"})
+
+    def test_export_version_notes_with_reference_expansion_uses_own_note(self):
+        self.room.add("policy.md", ["legal"])
+        self._register_pair()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_version_note("policy.md", "policy note")
+        self.room.set_version_note("meeting.txt", "meeting note")
+        manifest = self.room.export_manifest("R1", ["legal"], include_references=True,
+                                             include_version_notes=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertEqual(by_path["meeting.txt"]["version_note"], "meeting note")
+        self.assertEqual(by_path["policy.md"]["version_note"], "policy note")
+        # A note never affects status or completeness.
+        (self.root / "meeting.txt").write_text("changed notes\n", encoding="utf-8")
+        manifest = self.room.export_manifest("R1", ["legal"], include_references=True,
+                                             include_version_notes=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["meeting.txt"]["status"], "changed")
+        self.assertEqual(by_path["meeting.txt"]["version_note"], "meeting note")
+        self.assertFalse(manifest["complete"])
+
+    def test_export_version_notes_requires_boolean(self):
+        self.room.add("policy.md")
+        for bad in (1, "yes", None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_manifest("R1", include_version_notes=bad)
+
+    def test_export_version_notes_validates_whole_index(self):
+        self.room.add("policy.md")
+        self._register_pair()
+        valid = self.index.read_text(encoding="utf-8")
+        stored = json.loads(valid)
+        # The corrupt record is not selected, yet the notes export still fails.
+        stored["meeting.txt"]["version_note"] = ["not", "a", "string"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", ["legal"], include_version_notes=True)
+        # A dangling reference on an unrelated record invalidates it too.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", include_version_notes=True)
+        # The default export keeps the original behaviour and ignores extra fields.
+        manifest = self.room.export_manifest("R1")
+        self.assertEqual(len(manifest["documents"]), 2)
+        self.assertTrue(
+            all("version_note" not in d for d in manifest["documents"]))
+
+    def test_export_version_notes_without_index_empty_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root / "nested", self.root / "fresh.json")
+        manifest = fresh.export_manifest("r", include_version_notes=True)
+        self.assertEqual(manifest["documents"], [])
+        self.assertFalse(manifest["complete"])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_import_version_note_preserved_conflicts_and_type(self):
+        def record(path, **overrides):
+            record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                      "sha256": "hash-" + path, "tags": ["legal"]}
+            record.update(overrides)
+            return record
+        batch = {"policy.md": record("policy.md", version_note="  keep as given  \nx")}
+        self.assertEqual(self.room.import_records(batch)["added"], ["policy.md"])
+        # Import stores the note verbatim, without stripping.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["version_note"], "  keep as given  \nx")
+        # A differing note is a conflict, not an overwrite.
+        with self.assertRaises(ValueError):
+            self.room.import_records(
+                {"policy.md": record("policy.md", version_note="different")})
+        # An identical record (same note) counts as unchanged.
+        result = self.room.import_records(batch)
+        self.assertEqual(result["unchanged"], ["policy.md"])
+        # A non-string version_note fails the batch even on an unimported record.
+        with self.assertRaises(ValueError):
+            self.room.import_records(
+                {"other.md": record("other.md"),
+                 "bad.md": record("bad.md", version_note=5)})
+        # A bad version_note already in the index blocks later imports.
+        current = json.loads(self.index.read_text(encoding="utf-8"))
+        current["bad.md"] = record("bad.md", version_note=False)
+        self.index.write_text(json.dumps(current), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.import_records({"other.md": record("other.md")})
+
+    def test_compare_preserves_version_note_without_comparing_it(self):
+        def doc(path, **overrides):
+            document = {"path": path, "name": path, "bytes": 10,
+                        "sha256": "hash-" + path, "tags": ["a"], "status": "ready"}
+            document.update(overrides)
+            return document
+        before = {"release": "R1", "complete": True,
+                  "documents": [doc("a.md", version_note="old note")]}
+        after = {"release": "R1", "complete": True,
+                 "documents": [doc("a.md", version_note="new note")]}
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["unchanged"], ["a.md"])
+        self.assertEqual(result["changed"], [])
+        added = dict(after)
+        added["documents"] = [doc("b.md", version_note="b note")]
+        result = DocumentRoom.compare_manifests(before, added)
+        self.assertEqual(result["added"][0]["version_note"], "b note")
+
+    def test_cli_note_and_export_with_version_notes(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        self.room.add("policy.md", ["legal"])
+        self._register_pair()
+        result = subprocess.run(prefix + ["note", "policy.md", "--value", " Release line 1\nline 2 "],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["version_note"],
+                         "Release line 1\nline 2")
+        # --value is required.
+        result = subprocess.run(prefix + ["note", "policy.md"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        # An unknown path is a JSON error with exit 2.
+        result = subprocess.run(prefix + ["note", "ghost.md", "--value", "x"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # Export with the flag carries the note; the other document gets "".
+        result = subprocess.run(
+            prefix + ["export", "--release", "R1", "--with-version-notes"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        by_path = {d["path"]: d for d in json.loads(result.stdout)["documents"]}
+        self.assertEqual(by_path["policy.md"]["version_note"], "Release line 1\nline 2")
+        self.assertEqual(by_path["meeting.txt"]["version_note"], "")
+        # Without the flag the field is absent.
+        result = subprocess.run(prefix + ["export", "--release", "R1"],
+                                capture_output=True, text=True)
+        documents = json.loads(result.stdout)["documents"]
+        self.assertTrue(all("version_note" not in d for d in documents))
+
+
 class RemoveTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
