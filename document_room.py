@@ -8,6 +8,7 @@ from pathlib import Path
 class DocumentRoom:
     STATUSES = {"ready", "changed", "missing", "unsafe", "unreadable"}
     COMPARED_FIELDS = ("bytes", "name", "sha256", "status", "tags")
+    ARCHIVE_STATES = ("all", "active", "archived")
 
     def __init__(self, root, index):
         self.root = Path(root).resolve()
@@ -31,7 +32,21 @@ class DocumentRoom:
                     or not isinstance(record.get("tags"), list)
                     or not all(isinstance(tag, str) for tag in record["tags"])):
                 raise ValueError("index record has invalid field types")
+            if "archived" in record and not isinstance(record["archived"], bool):
+                raise ValueError("index record archived must be a boolean")
         return records
+
+    @staticmethod
+    def _check_archive_state(archive_state):
+        if not isinstance(archive_state, str) or archive_state not in DocumentRoom.ARCHIVE_STATES:
+            raise ValueError("archive_state must be one of all, active, archived")
+
+    @staticmethod
+    def _matches_archive_state(record, archive_state):
+        if archive_state == "all":
+            return True
+        is_archived = record.get("archived", False)
+        return is_archived if archive_state == "archived" else not is_archived
 
     def _load_validated_with_references(self):
         records = self._load_validated()
@@ -58,6 +73,8 @@ class DocumentRoom:
         existing = records.get(key)
         if isinstance(existing, dict) and "references" in existing:
             record["references"] = existing["references"]
+        if isinstance(existing, dict) and "archived" in existing:
+            record["archived"] = existing["archived"]
         records[key] = record
         self.index.parent.mkdir(parents=True, exist_ok=True)
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -77,6 +94,19 @@ class DocumentRoom:
                 raise ValueError("reference target is not registered")
         record = records[relative_path]
         record["references"] = sorted(set(targets))
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return record
+
+    def set_archived(self, relative_path, archived):
+        if not isinstance(relative_path, str):
+            raise ValueError("document path must be a string")
+        if not isinstance(archived, bool):
+            raise ValueError("archived must be a boolean")
+        records = self._load_validated_with_references()
+        if relative_path not in records:
+            raise ValueError("document is not registered")
+        record = records[relative_path]
+        record["archived"] = archived
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
@@ -108,10 +138,17 @@ class DocumentRoom:
                      for key in sorted(distances, key=lambda key: (distances[key], key))]
         return {"path": target, "documents": documents}
 
-    def search(self, tags=(), text=""):
+    def search(self, tags=(), text="", archive_state="all"):
+        self._check_archive_state(archive_state)
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
-        return [record for _, record in sorted(self._load().items())
-                if wanted.issubset(record["tags"]) and text.casefold() in record["path"].casefold()]
+        if archive_state == "all":
+            records = self._load()
+        else:  # a non-trivial archive filter validates the whole index, references included
+            records = self._load_validated_with_references()
+        return [record for _, record in sorted(records.items())
+                if wanted.issubset(record["tags"])
+                and text.casefold() in record["path"].casefold()
+                and self._matches_archive_state(record, archive_state)]
 
     def find_duplicates(self, tags=(), text=""):
         if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
@@ -155,28 +192,36 @@ class DocumentRoom:
         except (OSError, RuntimeError, ValueError):
             return "unreadable"
 
-    def export_manifest(self, release, tags=(), text="", include_references=False):
+    def export_manifest(self, release, tags=(), text="", include_references=False,
+                        archive_state="all"):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
+        self._check_archive_state(archive_state)
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
-        if include_references:
+
+        def matches(record):
+            return (wanted.issubset(record["tags"])
+                    and text.casefold() in record["path"].casefold()
+                    and self._matches_archive_state(record, archive_state))
+
+        if include_references or archive_state != "all":
             records = self._load_validated_with_references()
+        else:
+            records = self._load_validated()
+        if include_references:
             selected = {}
-            stack = [key for key, record in records.items()
-                     if wanted.issubset(record["tags"])
-                     and text.casefold() in record["path"].casefold()]
+            stack = [key for key, record in records.items() if matches(record)]
             while stack:
                 key = stack.pop()
                 if key in selected:
                     continue
                 selected[key] = records[key]
+                # Referenced documents are pulled in regardless of archive state.
                 stack.extend(records[key].get("references", []))
             ordered = [selected[key] for key in sorted(selected)]
         else:
-            ordered = [record for _, record in sorted(self._load_validated().items())
-                       if wanted.issubset(record["tags"])
-                       and text.casefold() in record["path"].casefold()]
+            ordered = [record for _, record in sorted(records.items()) if matches(record)]
         documents = []
         for record in ordered:
             documents.append({"path": record["path"], "name": record["name"],
@@ -284,6 +329,10 @@ def main():
     search = commands.add_parser("search")
     search.add_argument("--tag", action="append", default=[])
     search.add_argument("--text", default="")
+    search.add_argument("--archive-state", default="all")
+    archive = commands.add_parser("archive")
+    archive.add_argument("path")
+    archive.add_argument("--restore", action="store_true")
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
@@ -298,6 +347,7 @@ def main():
     export.add_argument("--tag", action="append", default=[])
     export.add_argument("--text", default="")
     export.add_argument("--with-references", action="store_true")
+    export.add_argument("--archive-state", default="all")
     compare = commands.add_parser("compare")
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
@@ -306,8 +356,10 @@ def main():
         room = DocumentRoom(args.root, args.index)
         if args.command == "add":
             result = room.add(args.path, args.tag)
+        elif args.command == "archive":
+            result = room.set_archived(args.path, not args.restore)
         elif args.command == "search":
-            result = room.search(args.tag, args.text)
+            result = room.search(args.tag, args.text, args.archive_state)
         elif args.command == "refs":
             result = room.set_references(args.path, args.to)
         elif args.command == "impact":
@@ -318,7 +370,8 @@ def main():
             result = room.compare_manifest_files(args.before, args.after)
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
-                                          include_references=args.with_references)
+                                          include_references=args.with_references,
+                                          archive_state=args.archive_state)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:
