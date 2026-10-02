@@ -191,6 +191,57 @@ class DocumentRoom:
         return {"removed": removed,
                 "updated": sorted(updated, key=lambda record: record["path"])}
 
+    def relocate_record(self, source, destination):
+        if not isinstance(source, str) or not isinstance(destination, str):
+            raise ValueError("source and destination paths must be strings")
+        # The whole index must be structurally sound before anything changes.
+        records = self._load_validated_with_version_notes()
+        if source not in records:
+            raise ValueError("source document is not registered")
+        # The destination is resolved against the live filesystem exactly like
+        # add; the source key is never resolved or read.
+        try:
+            path = (self.root / destination).resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("destination must be a file inside the document root")
+        if not path.is_relative_to(self.root):
+            raise ValueError("destination must be a file inside the document root")
+        if not path.is_file():
+            raise ValueError("destination must be a file inside the document root")
+        key = path.relative_to(self.root).as_posix()
+        if key in records:  # the destination key must be free, source itself included
+            raise ValueError("destination document is already registered")
+        original = records[source]
+        content = path.read_bytes()
+        if (len(content) != original["bytes"]
+                or hashlib.sha256(content).hexdigest() != original["sha256"]):
+            raise ValueError("destination content does not match the registered bytes or sha256")
+        before = dict(original)
+        after = dict(original)
+        after["path"] = key
+        after["name"] = path.name
+        if "references" in after:  # the moved record's own self-reference follows too
+            after["references"] = [key if target == source else target
+                                   for target in after["references"]]
+        # Every other record's references to the old key follow it to the new
+        # key; order and duplicates are preserved and records without references
+        # stay untouched.
+        updated = []
+        for other, record in records.items():
+            if other == source or "references" not in record:
+                continue
+            if source in record["references"]:
+                record["references"] = [key if target == source else target
+                                        for target in record["references"]]
+                updated.append(record)
+        del records[source]
+        records[key] = after
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+        return {"before": before,
+                "after": after,
+                "updated": sorted(updated, key=lambda record: record["path"])}
+
     @staticmethod
     def _validate_importable(records):
         # Per-record field and type checks shared by the stored index and an
@@ -554,6 +605,9 @@ def main():
     remove = commands.add_parser("remove")
     remove.add_argument("path")
     remove.add_argument("--detach", action="store_true")
+    relocate = commands.add_parser("relocate")
+    relocate.add_argument("source")
+    relocate.add_argument("destination")
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
@@ -595,6 +649,8 @@ def main():
             result = room.set_version_note(args.path, args.value)
         elif args.command == "remove":
             result = room.remove_record(args.path, detach=args.detach)
+        elif args.command == "relocate":
+            result = room.relocate_record(args.source, args.destination)
         elif args.command == "search":
             result = room.search(args.tag, args.text, args.archive_state, args.category)
         elif args.command == "refs":
