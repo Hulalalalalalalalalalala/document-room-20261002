@@ -802,6 +802,163 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertIn("error", json.loads(result.stdout))
 
 
+    def _make(self, name, body="body\n", tags=()):
+        (self.root / name).write_text(body, encoding="utf-8")
+        self.room.add(name, list(tags))
+
+    def test_export_origins_distances_for_shared_referenced_document(self):
+        # a.md and b.md are selected; a -> c, b -> d -> c.
+        self._make("a.md", tags=["pick"])
+        self._make("b.md", tags=["pick"])
+        self._make("c.md")
+        self._make("d.md")
+        self.room.set_references("a.md", ["c.md"])
+        self.room.set_references("b.md", ["d.md"])
+        self.room.set_references("d.md", ["c.md"])
+        manifest = self.room.export_manifest("R1", ["pick"],
+                                             include_references=True,
+                                             include_origins=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        # Documents keep the existing path-sorted order.
+        self.assertEqual(list(by_path), ["a.md", "b.md", "c.md", "d.md"])
+        self.assertEqual(by_path["a.md"]["origins"], [{"path": "a.md", "distance": 0}])
+        self.assertEqual(by_path["b.md"]["origins"], [{"path": "b.md", "distance": 0}])
+        # The shared document keeps both starts at their minimum distances.
+        self.assertEqual(by_path["c.md"]["origins"],
+                         [{"path": "a.md", "distance": 1},
+                          {"path": "b.md", "distance": 2}])
+        self.assertEqual(by_path["d.md"]["origins"], [{"path": "b.md", "distance": 1}])
+        # Origins are the only added field.
+        self.assertEqual(set(by_path["c.md"]),
+                         {"path", "name", "bytes", "sha256", "tags", "status", "origins"})
+
+    def test_export_origins_cycle_back_to_starting_document(self):
+        # If c references a, a is also reachable from b via b -> d -> c -> a.
+        self._make("a.md", tags=["pick"])
+        self._make("b.md", tags=["pick"])
+        self._make("c.md")
+        self._make("d.md")
+        self.room.set_references("a.md", ["c.md"])
+        self.room.set_references("b.md", ["d.md"])
+        self.room.set_references("d.md", ["c.md"])
+        self.room.set_references("c.md", ["a.md"])
+        manifest = self.room.export_manifest("R1", ["pick"],
+                                             include_references=True,
+                                             include_origins=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["a.md"]["origins"],
+                         [{"path": "a.md", "distance": 0},
+                          {"path": "b.md", "distance": 3}])
+        self.assertEqual(by_path["c.md"]["origins"],
+                         [{"path": "a.md", "distance": 1},
+                          {"path": "b.md", "distance": 2}])
+
+    def test_export_origins_self_reference_and_shortest_route(self):
+        # A self-reference keeps the start at distance 0; an alternative longer
+        # route never replaces a shorter one.
+        self._make("a.md", tags=["pick"])
+        self._make("b.md", tags=["pick"])
+        self._make("c.md")
+        self.room.set_references("a.md", ["a.md", "c.md"])  # self-reference
+        self.room.set_references("c.md", ["a.md", "c.md"])
+        self.room.set_references("b.md", ["a.md"])  # b reaches a directly (1)
+        manifest = self.room.export_manifest("R1", ["pick"],
+                                             include_references=True,
+                                             include_origins=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["a.md"]["origins"],
+                         [{"path": "a.md", "distance": 0},
+                          {"path": "b.md", "distance": 1}])
+        self.assertEqual(by_path["c.md"]["origins"],
+                         [{"path": "a.md", "distance": 1},
+                          {"path": "b.md", "distance": 2}])
+
+    def test_export_origins_sorted_case_sensitively(self):
+        # Case-sensitive lexicographic order follows Python's string ordering.
+        self._make("B.md", tags=["pick"])
+        self._make("a.md", tags=["pick"])
+        self._make("z.md")
+        self.room.set_references("B.md", ["z.md"])
+        self.room.set_references("a.md", ["z.md"])
+        manifest = self.room.export_manifest("R1", ["pick"],
+                                             include_references=True,
+                                             include_origins=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual([o["path"] for o in by_path["z.md"]["origins"]],
+                         ["B.md", "a.md"])
+
+    def test_export_origins_empty_selection(self):
+        self._make("a.md")
+        manifest = self.room.export_manifest("R1", ["pick"],
+                                             include_references=True,
+                                             include_origins=True)
+        self.assertEqual(manifest["documents"], [])
+        self.assertFalse(manifest["complete"])
+
+    def test_export_without_origins_has_no_origins_field(self):
+        self._make("a.md", tags=["pick"])
+        self._make("c.md")
+        self.room.set_references("a.md", ["c.md"])
+        expanded = self.room.export_manifest("R1", ["pick"], include_references=True)
+        self.assertTrue(all("origins" not in d for d in expanded["documents"]))
+        plain = self.room.export_manifest("R1", ["pick"])
+        self.assertTrue(all("origins" not in d for d in plain["documents"]))
+
+    def test_export_origins_validation(self):
+        for bad in (None, 1, "yes", ["x"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_manifest("R1", include_references=True,
+                                          include_origins=bad)
+        # Origins require reference expansion.
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", include_origins=True)
+
+    def test_export_origins_validates_whole_index_even_unselected(self):
+        self._make("a.md", tags=["pick"])
+        self._make("c.md")
+        self.room.set_references("a.md", ["c.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        # A dangling reference on an unselected record still invalidates export.
+        stored["c.md"]["references"] = ["ghost.md"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", ["pick"], include_references=True,
+                                      include_origins=True)
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", ["pick"], include_references=True,
+                                      include_origins=True)
+
+    def test_export_origins_without_index_is_empty_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        manifest = fresh.export_manifest("R1", ["pick"], include_references=True,
+                                         include_origins=True)
+        self.assertEqual(manifest["documents"], [])
+        self.assertFalse(manifest["complete"])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_cli_export_with_origins(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        self._make("a.md", tags=["pick"])
+        self._make("c.md")
+        self.room.set_references("a.md", ["c.md"])
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--tag", "pick",
+                                          "--with-references", "--with-origins"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["c.md"]["origins"],
+                         [{"path": "a.md", "distance": 1}])
+        # --with-origins without --with-references is an error payload, exit 2.
+        result = subprocess.run(prefix + ["export", "--release", "R1",
+                                          "--with-origins"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+
 class ManifestComparisonTests(unittest.TestCase):
     def doc(self, path, **overrides):
         document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
@@ -888,6 +1045,15 @@ class ManifestComparisonTests(unittest.TestCase):
         # Extra top-level fields are tolerated too.
         before["generated_by"] = "export"
         self.assertEqual(DocumentRoom.compare_manifests(before, after)["unchanged"], ["d.md"])
+
+    def test_origins_field_preserved_but_not_compared(self):
+        origins_a = [{"path": "a.md", "distance": 0}]
+        origins_b = [{"path": "other.md", "distance": 3}]
+        before = self.manifest([self.doc("d.md", origins=origins_a)])
+        after = self.manifest([self.doc("d.md", origins=origins_b)])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["unchanged"], ["d.md"])
+        self.assertEqual(result["changed"], [])
 
     def test_both_empty(self):
         result = DocumentRoom.compare_manifests(self.manifest([]), self.manifest([]))
