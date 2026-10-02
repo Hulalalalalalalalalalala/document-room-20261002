@@ -2346,5 +2346,191 @@ class RelocateTests(unittest.TestCase):
         self.assertFalse((self.root / "fresh.json").exists())
 
 
+class EditTagsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def _register_pair(self):
+        policy = self.room.add("policy.md", ["legal", "policy"])
+        meeting = self.room.add("meeting.txt", ["operations"])
+        return policy, meeting
+
+    def test_add_remove_normalize_dedupe_and_sort(self):
+        self._register_pair()
+        result = self.room.edit_tags(
+            ["policy.md", "meeting.txt"],
+            add_tags=[" Release ", "LEGAL", "", "release"],
+            remove_tags=[" policy ", "missing-tag"])
+        self.assertEqual(result["unchanged"], [])
+        updated = {record["path"]: record for record in result["updated"]}
+        self.assertEqual(sorted(updated), ["meeting.txt", "policy.md"])
+        self.assertEqual(updated["policy.md"]["tags"], ["legal", "release"])
+        self.assertEqual(updated["meeting.txt"]["tags"],
+                         ["legal", "operations", "release"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["tags"], ["legal", "release"])
+        self.assertEqual(stored["meeting.txt"]["tags"],
+                         ["legal", "operations", "release"])
+
+    def test_unchanged_paths_and_noop_write_nothing(self):
+        self._register_pair()
+        before = self.index.read_bytes()
+        # Adding an existing tag and removing an absent one change nothing.
+        result = self.room.edit_tags(["policy.md"], add_tags=["legal"],
+                                     remove_tags=["unknown"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["unchanged"], ["policy.md"])
+        self.assertEqual(self.index.read_bytes(), before)
+        # A batch where every path is unchanged never writes the index.
+        result = self.room.edit_tags(["policy.md", "meeting.txt"],
+                                     remove_tags=["unknown"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["unchanged"], ["meeting.txt", "policy.md"])
+        self.assertEqual(self.index.read_bytes(), before)
+
+    def test_normalization_only_change_counts_as_update(self):
+        self._register_pair()
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["policy.md"]["tags"] = [" Legal ", "POLICY", "legal", "legal"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        result = self.room.edit_tags(["policy.md"])
+        self.assertEqual(result["unchanged"], [])
+        self.assertEqual([record["path"] for record in result["updated"]],
+                         ["policy.md"])
+        self.assertEqual(result["updated"][0]["tags"], ["legal", "policy"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["tags"], ["legal", "policy"])
+
+    def test_only_selected_records_change_and_files_are_untouched(self):
+        self._register_pair()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_archived("meeting.txt", True)
+        self.room.set_category("meeting.txt", "Ops")
+        self.room.set_version_note("meeting.txt", "v1")
+        before = json.loads(self.index.read_text(encoding="utf-8"))
+        # Missing and changed files do not affect the metadata-only edit.
+        (self.root / "meeting.txt").unlink()
+        (self.root / "policy.md").write_text("Totally different", encoding="utf-8")
+        result = self.room.edit_tags(["meeting.txt"], add_tags=["release"])
+        self.assertEqual([record["path"] for record in result["updated"]],
+                         ["meeting.txt"])
+        record = result["updated"][0]
+        self.assertEqual(record["tags"], ["operations", "release"])
+        self.assertIs(record["archived"], True)
+        self.assertEqual(record["category"], "Ops")
+        self.assertEqual(record["version_note"], "v1")
+        self.assertEqual(record["bytes"], before["meeting.txt"]["bytes"])
+        self.assertEqual(record["sha256"], before["meeting.txt"]["sha256"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"], before["policy.md"])
+        self.assertFalse((self.root / "meeting.txt").exists())
+
+    def test_duplicate_paths_processed_once(self):
+        self._register_pair()
+        result = self.room.edit_tags(["policy.md", "policy.md"], add_tags=["release"])
+        self.assertEqual([record["path"] for record in result["updated"]],
+                         ["policy.md"])
+        self.assertEqual(result["unchanged"], [])
+        # A repeated unchanged path also appears only once.
+        result = self.room.edit_tags(["meeting.txt", "meeting.txt"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["unchanged"], ["meeting.txt"])
+
+    def test_empty_paths_and_missing_index(self):
+        result = self.room.edit_tags([])
+        self.assertEqual(result, {"updated": [], "unchanged": []})
+        self.assertFalse(self.index.exists())
+        with self.assertRaises(ValueError):
+            self.room.edit_tags(["policy.md"])
+        self.assertFalse(self.index.exists())
+        # With an index present, empty paths still return two empty arrays.
+        self._register_pair()
+        before = self.index.read_bytes()
+        self.assertEqual(self.room.edit_tags(()), {"updated": [], "unchanged": []})
+        self.assertEqual(self.index.read_bytes(), before)
+
+    def test_invalid_arguments_raise_value_error(self):
+        self._register_pair()
+        before = self.index.read_bytes()
+        for paths, add_tags, remove_tags in (
+                ("policy.md", (), ()),
+                (["policy.md", 7], (), ()),
+                (["policy.md"], "release", ()),
+                (["policy.md"], ["release", None], ()),
+                (["policy.md"], (), "policy"),
+                (["policy.md"], (), ["policy", 7]),
+                (["policy.md"], ["release"], [" RELEASE "]),
+                (["policy.md"], ["", " x "], ["x"]),
+                (["policy.md", "ghost.txt"], (), ()),
+                (["Policy.md"], (), ())):  # keys are case-sensitive
+            with self.assertRaises(ValueError):
+                self.room.edit_tags(paths, add_tags=add_tags, remove_tags=remove_tags)
+        self.assertEqual(self.index.read_bytes(), before)
+
+    def test_invalid_index_fails_even_when_unselected(self):
+        self._register_pair()
+        valid = self.index.read_text(encoding="utf-8")
+        for mutate in (
+                lambda s: s.update(policy="not-a-record"),
+                lambda s: s["meeting.txt"].update(bytes="17"),
+                lambda s: s["meeting.txt"].update(references="policy.md"),
+                lambda s: s["meeting.txt"].update(references=["ghost.txt"]),
+                lambda s: s["meeting.txt"].update(archived="yes"),
+                lambda s: s["meeting.txt"].update(category=7),
+                lambda s: s["meeting.txt"].update(version_note=7)):
+            stored = json.loads(valid)
+            mutate(stored)
+            self.index.write_text(json.dumps(stored), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.room.edit_tags(["policy.md"], add_tags=["release"])
+            self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")),
+                             stored)
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.edit_tags(["policy.md"], add_tags=["release"])
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.edit_tags(["policy.md"], add_tags=["release"])
+
+    def test_cli_tags_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        subprocess.run(prefix + ["add", "policy.md", "--tag", "legal"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "meeting.txt", "--tag", "operations"],
+                       capture_output=True, check=True)
+        result = subprocess.run(
+            prefix + ["tags", "policy.md", "meeting.txt",
+                      "--add", " Release ", "--remove", "legal"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(set(payload), {"updated", "unchanged"})
+        self.assertEqual(payload["unchanged"], [])
+        updated = {record["path"]: record["tags"] for record in payload["updated"]}
+        self.assertEqual(updated, {"policy.md": ["release"],
+                                   "meeting.txt": ["operations", "release"]})
+        # Search uses the new tags afterwards.
+        found = subprocess.run(prefix + ["search", "--tag", "release"],
+                               capture_output=True, text=True, check=True)
+        self.assertEqual([r["path"] for r in json.loads(found.stdout)],
+                         ["meeting.txt", "policy.md"])
+        # Business errors and a missing path argument are JSON errors, exit 2.
+        before = self.index.read_bytes()
+        for extra in (["tags", "ghost.txt", "--add", "x"],
+                      ["tags", "policy.md", "--add", "x", "--remove", "X"],
+                      ["tags"]):
+            result = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertIn("error", json.loads(result.stdout))
+        self.assertEqual(self.index.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -165,6 +165,42 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    def edit_tags(self, paths, add_tags=(), remove_tags=()):
+        if (not isinstance(paths, (list, tuple))
+                or not all(isinstance(path, str) for path in paths)):
+            raise ValueError("paths must be a list or tuple of strings")
+        if (not isinstance(add_tags, (list, tuple))
+                or not all(isinstance(tag, str) for tag in add_tags)):
+            raise ValueError("add_tags must be a list or tuple of strings")
+        if (not isinstance(remove_tags, (list, tuple))
+                or not all(isinstance(tag, str) for tag in remove_tags)):
+            raise ValueError("remove_tags must be a list or tuple of strings")
+        added = {tag.strip().lower() for tag in add_tags if tag.strip()}
+        removed = {tag.strip().lower() for tag in remove_tags if tag.strip()}
+        if added & removed:
+            raise ValueError("add_tags and remove_tags must not overlap")
+        records = self._load_validated_with_version_notes()
+        selected = list(dict.fromkeys(paths))  # each path is processed once
+        for path in selected:
+            if path not in records:
+                raise ValueError("document is not registered")
+        updated = []
+        unchanged = []
+        for path in selected:
+            record = records[path]
+            final = sorted(({tag.strip().lower() for tag in record["tags"] if tag.strip()}
+                            - removed) | added)
+            if final != record["tags"]:  # normalization alone can be a change
+                record["tags"] = final
+                updated.append(record)
+            else:
+                unchanged.append(path)
+        if updated:
+            self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+        return {"updated": sorted(updated, key=lambda record: record["path"]),
+                "unchanged": sorted(unchanged)}
+
     def remove_record(self, relative_path, detach=False):
         if not isinstance(relative_path, str):
             raise ValueError("document path must be a string")
@@ -609,6 +645,10 @@ def main():
     add = commands.add_parser("add")
     add.add_argument("path")
     add.add_argument("--tag", action="append", default=[])
+    tags = commands.add_parser("tags")
+    tags.add_argument("paths", nargs="*")
+    tags.add_argument("--add", action="append", default=[])
+    tags.add_argument("--remove", action="append", default=[])
     search = commands.add_parser("search")
     search.add_argument("--tag", action="append", default=[])
     search.add_argument("--text", default="")
@@ -663,6 +703,11 @@ def main():
         room = DocumentRoom(args.root, args.index)
         if args.command == "add":
             result = room.add(args.path, args.tag)
+        elif args.command == "tags":
+            if not args.paths:
+                raise ValueError("tags requires at least one path")
+            result = room.edit_tags(args.paths, add_tags=args.add,
+                                    remove_tags=args.remove)
         elif args.command == "archive":
             result = room.set_archived(args.path, not args.restore)
         elif args.command == "category":
