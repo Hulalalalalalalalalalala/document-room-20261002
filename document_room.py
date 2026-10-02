@@ -48,6 +48,17 @@ class DocumentRoom:
         is_archived = record.get("archived", False)
         return is_archived if archive_state == "archived" else not is_archived
 
+    @staticmethod
+    def _check_category_filter(category):
+        if category is not None and not isinstance(category, str):
+            raise ValueError("category filter must be a string or None")
+
+    @staticmethod
+    def _matches_category(record, category):
+        if category is None:
+            return True
+        return record.get("category", "").strip() == category.strip()
+
     def _load_validated_with_references(self):
         records = self._load_validated()
         for record in records.values():
@@ -58,6 +69,13 @@ class DocumentRoom:
             for target in references:
                 if target not in records:
                     raise ValueError("index record references an unregistered path")
+        return records
+
+    def _load_validated_with_categories(self):
+        records = self._load_validated_with_references()
+        for record in records.values():
+            if "category" in record and not isinstance(record["category"], str):
+                raise ValueError("index record category must be a string")
         return records
 
     def add(self, relative_path, tags=()):
@@ -75,6 +93,8 @@ class DocumentRoom:
             record["references"] = existing["references"]
         if isinstance(existing, dict) and "archived" in existing:
             record["archived"] = existing["archived"]
+        if isinstance(existing, dict) and "category" in existing:
+            record["category"] = existing["category"]
         records[key] = record
         self.index.parent.mkdir(parents=True, exist_ok=True)
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -110,6 +130,19 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    def set_category(self, relative_path, category):
+        if not isinstance(relative_path, str):
+            raise ValueError("document path must be a string")
+        if not isinstance(category, str):
+            raise ValueError("category must be a string")
+        records = self._load_validated_with_categories()
+        if relative_path not in records:
+            raise ValueError("document is not registered")
+        record = records[relative_path]
+        record["category"] = category.strip()
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return record
+
     def reference_impact(self, target, transitive=False):
         if not isinstance(target, str):
             raise ValueError("target path must be a string")
@@ -138,17 +171,19 @@ class DocumentRoom:
                      for key in sorted(distances, key=lambda key: (distances[key], key))]
         return {"path": target, "documents": documents}
 
-    def search(self, tags=(), text="", archive_state="all"):
+    def search(self, tags=(), text="", archive_state="all", category=None):
         self._check_archive_state(archive_state)
+        self._check_category_filter(category)
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
-        if archive_state == "all":
+        if archive_state == "all" and category is None:
             records = self._load()
-        else:  # a non-trivial archive filter validates the whole index, references included
-            records = self._load_validated_with_references()
+        else:  # a non-trivial filter validates the whole index, references included
+            records = self._load_validated_with_categories()
         return [record for _, record in sorted(records.items())
                 if wanted.issubset(record["tags"])
                 and text.casefold() in record["path"].casefold()
-                and self._matches_archive_state(record, archive_state)]
+                and self._matches_archive_state(record, archive_state)
+                and self._matches_category(record, category)]
 
     def find_duplicates(self, tags=(), text=""):
         if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
@@ -193,20 +228,22 @@ class DocumentRoom:
             return "unreadable"
 
     def export_manifest(self, release, tags=(), text="", include_references=False,
-                        archive_state="all"):
+                        archive_state="all", category=None):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
         self._check_archive_state(archive_state)
+        self._check_category_filter(category)
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
 
         def matches(record):
             return (wanted.issubset(record["tags"])
                     and text.casefold() in record["path"].casefold()
-                    and self._matches_archive_state(record, archive_state))
+                    and self._matches_archive_state(record, archive_state)
+                    and self._matches_category(record, category))
 
-        if include_references or archive_state != "all":
-            records = self._load_validated_with_references()
+        if include_references or archive_state != "all" or category is not None:
+            records = self._load_validated_with_categories()
         else:
             records = self._load_validated()
         if include_references:
@@ -217,7 +254,8 @@ class DocumentRoom:
                 if key in selected:
                     continue
                 selected[key] = records[key]
-                # Referenced documents are pulled in regardless of archive state.
+                # Referenced documents are pulled in regardless of archive state
+                # or category.
                 stack.extend(records[key].get("references", []))
             ordered = [selected[key] for key in sorted(selected)]
         else:
@@ -330,9 +368,13 @@ def main():
     search.add_argument("--tag", action="append", default=[])
     search.add_argument("--text", default="")
     search.add_argument("--archive-state", default="all")
+    search.add_argument("--category", default=None)
     archive = commands.add_parser("archive")
     archive.add_argument("path")
     archive.add_argument("--restore", action="store_true")
+    category = commands.add_parser("category")
+    category.add_argument("path")
+    category.add_argument("--value", required=True)
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
@@ -348,6 +390,7 @@ def main():
     export.add_argument("--text", default="")
     export.add_argument("--with-references", action="store_true")
     export.add_argument("--archive-state", default="all")
+    export.add_argument("--category", default=None)
     compare = commands.add_parser("compare")
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
@@ -358,8 +401,10 @@ def main():
             result = room.add(args.path, args.tag)
         elif args.command == "archive":
             result = room.set_archived(args.path, not args.restore)
+        elif args.command == "category":
+            result = room.set_category(args.path, args.value)
         elif args.command == "search":
-            result = room.search(args.tag, args.text, args.archive_state)
+            result = room.search(args.tag, args.text, args.archive_state, args.category)
         elif args.command == "refs":
             result = room.set_references(args.path, args.to)
         elif args.command == "impact":
@@ -371,7 +416,8 @@ def main():
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references,
-                                          archive_state=args.archive_state)
+                                          archive_state=args.archive_state,
+                                          category=args.category)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:
