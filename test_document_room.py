@@ -598,6 +598,248 @@ class DocumentRoomTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("error", json.loads(result.stdout))
 
+    def _add_policy_and_meeting(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+
+    def test_set_category_trims_but_keeps_case_and_internal_whitespace(self):
+        record = self.room.add("policy.md", ["legal"])
+        self.assertNotIn("category", record)
+        updated = self.room.set_category("policy.md", "  Legal Docs ")
+        self.assertEqual(updated["category"], "Legal Docs")
+        self.assertEqual(updated["tags"], ["legal"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["policy.md"]["category"], "Legal Docs")
+        # The returned record is the complete stored record.
+        self.assertEqual(updated, stored["policy.md"])
+        # Setting the same value again returns the identical record.
+        self.assertEqual(self.room.set_category("policy.md", "Legal Docs"), updated)
+
+    def test_set_category_empty_string_means_uncategorized(self):
+        self.room.add("policy.md")
+        self.room.set_category("policy.md", "Legal")
+        cleared = self.room.set_category("policy.md", "   ")
+        self.assertNotIn("category", cleared)
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("category", stored["policy.md"])
+
+    def test_set_category_works_after_file_deleted_and_keeps_other_fields(self):
+        self._add_policy_and_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_archived("meeting.txt", True)
+        (self.root / "policy.md").unlink()
+        record = self.room.set_category("policy.md", "Legal")
+        self.assertEqual(record["category"], "Legal")
+        self.assertEqual(record["references"], ["meeting.txt"])
+        self.assertEqual(record["tags"], ["legal"])
+        self.assertNotIn("archived", record)
+        # Changing category preserves references and archived state.
+        again = self.room.set_category("policy.md", "  Compliance ")
+        self.assertEqual(again["category"], "Compliance")
+        self.assertEqual(again["references"], ["meeting.txt"])
+        meeting = self.room.set_category("meeting.txt", "Ops")
+        self.assertEqual(meeting["category"], "Ops")
+        self.assertTrue(meeting["archived"])
+
+    def test_add_preserves_category_but_first_add_has_none(self):
+        first = self.room.add("policy.md", ["legal"])
+        self.assertNotIn("category", first)
+        self.room.set_category("policy.md", "Legal")
+        (self.root / "policy.md").write_text("Revised policy\n", encoding="utf-8")
+        again = self.room.add("policy.md", ["updated"])
+        self.assertEqual(again["category"], "Legal")
+        self.assertEqual(again["tags"], ["updated"])
+
+    def test_set_category_validation_leaves_index_untouched(self):
+        self.room.add("policy.md")
+        before = self.index.read_text(encoding="utf-8")
+        for args in ((None, "Legal"), (7, "Legal"), ("policy.md", None),
+                     ("policy.md", 5), ("policy.md", ["Legal"]),
+                     ("missing.md", "Legal"), ("POLICY.MD", "Legal")):
+            with self.assertRaises(ValueError, msg=repr(args)):
+                self.room.set_category(*args)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_set_category_without_index_raises_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.set_category("policy.md", "Legal")
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_set_category_validates_whole_index_including_category(self):
+        self._add_policy_and_meeting()
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_category("policy.md", "Legal")
+        stored = json.loads(valid)
+        stored["meeting.txt"]["category"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):  # bad record need not be selected
+            self.room.set_category("policy.md", "Legal")
+        stored = json.loads(valid)
+        stored["policy.md"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_category("meeting.txt", "Ops")
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.set_category("policy.md", "Legal")
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_search_category_filter_matching_rules(self):
+        self._add_policy_and_meeting()
+        self.room.set_category("policy.md", "  Legal Docs ")
+        # meeting.txt stays uncategorized (no stored field).
+        self.assertEqual([r["path"] for r in self.room.search()],
+                         ["meeting.txt", "policy.md"])
+        self.assertEqual([r["path"] for r in self.room.search(category=None)],
+                         ["meeting.txt", "policy.md"])
+        # Stored and filter values are both trimmed, then compared exactly.
+        self.assertEqual([r["path"] for r in self.room.search(category="Legal Docs")],
+                         ["policy.md"])
+        self.assertEqual([r["path"] for r in self.room.search(category=" Legal Docs  ")],
+                         ["policy.md"])
+        # Case-sensitive full-string comparison.
+        self.assertEqual(self.room.search(category="legal docs"), [])
+        self.assertEqual(self.room.search(category="Legal"), [])
+        # Empty string selects only uncategorized records.
+        self.assertEqual([r["path"] for r in self.room.search(category="")],
+                         ["meeting.txt"])
+        # Intersection with tags, path text and archive state.
+        self.assertEqual([r["path"] for r in self.room.search(["legal"], category="Legal Docs")],
+                         ["policy.md"])
+        self.assertEqual(self.room.search(["operations"], category="Legal Docs"), [])
+        self.assertEqual(self.room.search(text="policy", category="Legal Docs")[0]["path"],
+                         "policy.md")
+        self.room.set_archived("policy.md", True)
+        self.assertEqual(
+            [r["path"] for r in self.room.search(archive_state="active", category="Legal Docs")],
+            [])
+        self.assertEqual(
+            [r["path"] for r in self.room.search(archive_state="archived",
+                                                 category="Legal Docs")][0],
+            "policy.md")
+        # Search still returns complete stored records without filling the field.
+        self.assertNotIn("category", self.room.search(category="")[0])
+
+    def test_search_category_validation_and_missing_index(self):
+        self.room.add("policy.md")
+        for bad in (5, ["Legal"], b"Legal"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.search(category=bad)
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["policy.md"]["category"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.search(category="Legal")
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.search(category="Legal"), [])
+        self.assertEqual(fresh.search(category=""), [])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_export_category_filters_start_documents_only(self):
+        self._add_policy_and_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_references("meeting.txt", ["policy.md"])  # edges both ways
+        self.room.set_category("policy.md", "Legal")
+        # Plain category filter excludes the other-category referenced document.
+        plain = self.room.export_manifest("R1", category="Legal")
+        self.assertEqual([d["path"] for d in plain["documents"]], ["policy.md"])
+        # Reference expansion pulls in the referenced document regardless of category.
+        expanded = self.room.export_manifest("R1", category="Legal",
+                                             include_references=True)
+        self.assertEqual([d["path"] for d in expanded["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertTrue(expanded["complete"])
+        # Empty string selects only uncategorized starting documents; expansion
+        # still reaches the categorized referenced document.
+        uncategorized = self.room.export_manifest("R1", category="",
+                                                  include_references=True)
+        self.assertEqual([d["path"] for d in uncategorized["documents"]],
+                         ["meeting.txt", "policy.md"])
+        only_uncategorized = self.room.export_manifest("R1", category="")
+        self.assertEqual([d["path"] for d in only_uncategorized["documents"]],
+                         ["meeting.txt"])
+        # Category takes the intersection with tag filters.
+        self.assertEqual(self.room.export_manifest("R1", ["operations"],
+                                                   category="Legal")["documents"], [])
+        # Manifest documents keep the original fields only (no category field).
+        self.assertEqual(set(expanded["documents"][0]),
+                         {"path", "name", "bytes", "sha256", "tags", "status"})
+
+    def test_export_category_validation_and_missing_index(self):
+        self.room.add("policy.md")
+        for bad in (5, ["Legal"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_manifest("R1", category=bad)
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["policy.md"]["category"] = False
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", category="Legal")
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        manifest = fresh.export_manifest("R1", category="Legal")
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(manifest["documents"], [])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_cli_category_and_category_filters(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        self._add_policy_and_meeting()
+        result = subprocess.run(prefix + ["category", "policy.md", "--value", "  Legal Docs "],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["category"], "Legal Docs")
+        result = subprocess.run(prefix + ["search", "--category", "Legal Docs"],
+                                capture_output=True, text=True)
+        self.assertEqual([r["path"] for r in json.loads(result.stdout)], ["policy.md"])
+        result = subprocess.run(prefix + ["search", "--category", ""],
+                                capture_output=True, text=True)
+        self.assertEqual([r["path"] for r in json.loads(result.stdout)], ["meeting.txt"])
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--category", "Legal Docs"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([d["path"] for d in json.loads(result.stdout)["documents"]],
+                         ["policy.md"])
+        # --value is required.
+        result = subprocess.run(prefix + ["category", "policy.md"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        # An unregistered path is a JSON error with exit 2.
+        result = subprocess.run(prefix + ["category", "ghost.md", "--value", "X"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+    def test_cross_category_reference_then_delete_and_recategorize(self):
+        self._add_policy_and_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_category("policy.md", "legal")
+        self.room.set_category("meeting.txt", "operations")
+        # Plain filter contains only the matching document...
+        plain = self.room.export_manifest("R1", category="legal")
+        self.assertEqual([d["path"] for d in plain["documents"]], ["policy.md"])
+        # ...while the expanded manifest includes the referenced document.
+        expanded = self.room.export_manifest("R1", category="legal",
+                                             include_references=True)
+        self.assertEqual([d["path"] for d in expanded["documents"]],
+                         ["meeting.txt", "policy.md"])
+        # Delete the original policy file: the category still updates and the
+        # export keeps reporting the missing status.
+        (self.root / "policy.md").unlink()
+        record = self.room.set_category("policy.md", "compliance")
+        self.assertEqual(record["category"], "compliance")
+        self.assertEqual(record["references"], ["meeting.txt"])
+        manifest = self.room.export_manifest("R1", category="compliance",
+                                             include_references=True)
+        statuses = {d["path"]: d["status"] for d in manifest["documents"]}
+        self.assertEqual(statuses, {"meeting.txt": "ready", "policy.md": "missing"})
+        self.assertFalse(manifest["complete"])
+
 
 class ManifestComparisonTests(unittest.TestCase):
     def doc(self, path, **overrides):
