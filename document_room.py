@@ -100,6 +100,72 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    @staticmethod
+    def _validate_records(records, check_targets=True):
+        # Full registered-format validation of any record mapping: required
+        # field types, optional references/archived/category types, and (unless
+        # suppressed) every reference target present among the records.
+        if not isinstance(records, dict):
+            raise ValueError("index must be a JSON object of records")
+        for key, record in records.items():
+            if (not isinstance(key, str) or not isinstance(record, dict)
+                    or record.get("path") != key):
+                raise ValueError("index records must be objects keyed by their path")
+            if (not isinstance(record.get("name"), str)
+                    or not isinstance(record.get("bytes"), int)
+                    or isinstance(record.get("bytes"), bool)
+                    or not isinstance(record.get("sha256"), str)
+                    or not isinstance(record.get("tags"), list)
+                    or not all(isinstance(tag, str) for tag in record["tags"])):
+                raise ValueError("index record has invalid field types")
+            if "archived" in record and not isinstance(record["archived"], bool):
+                raise ValueError("index record archived must be a boolean")
+            references = record.get("references", [])
+            if (not isinstance(references, list)
+                    or not all(isinstance(target, str) for target in references)):
+                raise ValueError("index record references must be a list of strings")
+            if "category" in record and not isinstance(record["category"], str):
+                raise ValueError("index record category must be a string")
+        if check_targets:
+            for record in records.values():
+                for target in record.get("references", []):
+                    if target not in records:
+                        raise ValueError("index record references an unregistered path")
+        return records
+
+    def import_records(self, records):
+        if not isinstance(records, dict):
+            raise ValueError("import payload must be a JSON object of records")
+        # Validate existing field types without requiring reference targets yet:
+        # a dangling target there may be supplied by this batch.
+        existing = self._validate_records(self._load(), check_targets=False)
+        added = []
+        unchanged = []
+        for key, incoming in records.items():
+            if not isinstance(key, str):
+                raise ValueError("import records must be keyed by string paths")
+            if key in existing:
+                # Plain dict/list equality: the field set must match exactly
+                # (a missing optional field differs from a stored default),
+                # array order matters and object key order does not.
+                if existing[key] != incoming:
+                    raise ValueError(
+                        f"imported record conflicts with an existing path: {key}")
+                unchanged.append(key)
+            else:
+                added.append(key)
+        merged = {**existing, **records}
+        # Full validation of input plus merged index; reference targets only
+        # need to exist in the union, so forward/self/cyclic references within
+        # the batch (or completing a dangling existing one) are accepted.
+        self._validate_records(merged)
+        if added:  # an empty or fully identical batch never touches the index
+            self.index.parent.mkdir(parents=True, exist_ok=True)
+            self.index.write_text(
+                json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+        return {"added": sorted(added), "unchanged": sorted(unchanged)}
+
     def set_references(self, relative_path, targets):
         if not isinstance(relative_path, str):
             raise ValueError("source path must be a string")
@@ -427,6 +493,8 @@ def main():
     compare = commands.add_parser("compare")
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
+    import_cmd = commands.add_parser("import")
+    import_cmd.add_argument("--from", dest="source", required=True)
     args = parser.parse_args()
     try:
         room = DocumentRoom(args.root, args.index)
@@ -446,6 +514,14 @@ def main():
             result = room.find_duplicates(args.tag, args.text)
         elif args.command == "compare":
             result = room.compare_manifest_files(args.before, args.after)
+        elif args.command == "import":
+            try:
+                payload = json.loads(Path(args.source).read_text(encoding="utf-8"))
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"import file is not valid UTF-8: {exc}")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"import file is not valid JSON: {exc}")
+            result = room.import_records(payload)
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references,
