@@ -524,6 +524,84 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("error", json.loads(result.stdout))
 
+    def test_reference_impact_routes_shortest_and_lexicographic(self):
+        for name in ("a.md", "b.md", "c.md", "z.md"):
+            (self.root / name).write_text(name + "\n", encoding="utf-8")
+            self.room.add(name)
+        self._add_meeting()
+        # a reaches meeting.txt in two edges via either b.md or c.md, and via a
+        # longer z.md chain; duplicate references must not duplicate results.
+        self.room.set_references("a.md", ["b.md", "c.md", "b.md"])
+        self.room.set_references("b.md", ["meeting.txt"])
+        self.room.set_references("c.md", ["meeting.txt"])
+        self.room.set_references("z.md", ["a.md"])
+        # Without the flag, results are unchanged and carry no route field.
+        plain = self.room.reference_impact("meeting.txt", transitive=True)
+        self.assertEqual([(d["path"], d["distance"]) for d in plain["documents"]],
+                         [("b.md", 1), ("c.md", 1), ("a.md", 2), ("z.md", 3)])
+        self.assertTrue(all("route" not in d for d in plain["documents"]))
+        routed = self.room.reference_impact("meeting.txt", transitive=True,
+                                            include_routes=True)
+        routes = {d["path"]: d["route"] for d in routed["documents"]}
+        self.assertEqual(routes, {
+            "b.md": ["b.md", "meeting.txt"],
+            "c.md": ["c.md", "meeting.txt"],
+            "a.md": ["a.md", "b.md", "meeting.txt"],
+            "z.md": ["z.md", "a.md", "b.md", "meeting.txt"],
+        })
+        for document in routed["documents"]:
+            self.assertEqual(len(document["route"]) - 1, document["distance"])
+            self.assertEqual(document["route"][0], document["path"])
+            self.assertEqual(document["route"][-1], "meeting.txt")
+            self.assertEqual(len(document["route"]), len(set(document["route"])))
+        # include_routes without transitive stays limited to direct referrers.
+        direct = self.room.reference_impact("meeting.txt", include_routes=True)
+        self.assertEqual([d["path"] for d in direct["documents"]], ["b.md", "c.md"])
+        # The tie-break ignores references array and record ordering.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        reversed_records = {key: stored[key] for key in reversed(list(stored))}
+        for record in reversed_records.values():
+            if "references" in record:
+                record["references"] = list(reversed(record["references"]))
+        self.index.write_text(json.dumps(reversed_records), encoding="utf-8")
+        again = DocumentRoom(self.root, self.index).reference_impact(
+            "meeting.txt", transitive=True, include_routes=True)
+        self.assertEqual({d["path"]: d["route"] for d in again["documents"]}, routes)
+
+    def test_reference_impact_route_cycles_and_validation(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt", "policy.md"])
+        self.room.set_references("meeting.txt", ["policy.md"])
+        result = self.room.reference_impact("policy.md", transitive=True,
+                                            include_routes=True)
+        self.assertEqual([d["route"] for d in result["documents"]],
+                         [["meeting.txt", "policy.md"]])
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt", include_routes="yes")
+        # An old record without references gives an empty result even with routes.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        del stored["policy.md"]["references"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        fresh = self.room.reference_impact("meeting.txt", transitive=True,
+                                           include_routes=True)
+        self.assertEqual(fresh["documents"], [])
+
+    def test_cli_impact_with_routes(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        result = subprocess.run(prefix + ["impact", "meeting.txt", "--with-routes"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)["documents"][0]
+        self.assertEqual(document["route"], ["policy.md", "meeting.txt"])
+        self.assertEqual(document["distance"], 1)
+        result = subprocess.run(prefix + ["impact", "meeting.txt"],
+                                capture_output=True, text=True)
+        self.assertNotIn("route", json.loads(result.stdout)["documents"][0])
+
     def test_find_duplicates_groups_by_bytes_and_sha256(self):
         (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
         (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
