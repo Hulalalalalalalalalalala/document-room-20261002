@@ -78,6 +78,13 @@ class DocumentRoom:
                 raise ValueError("index record category must be a string")
         return records
 
+    def _load_validated_with_version_notes(self):
+        records = self._load_validated_with_categories()
+        for record in records.values():
+            if "version_note" in record and not isinstance(record["version_note"], str):
+                raise ValueError("index record version_note must be a string")
+        return records
+
     def add(self, relative_path, tags=()):
         path = (self.root / relative_path).resolve()
         if not path.is_relative_to(self.root) or not path.is_file():
@@ -95,6 +102,8 @@ class DocumentRoom:
             record["archived"] = existing["archived"]
         if isinstance(existing, dict) and "category" in existing:
             record["category"] = existing["category"]
+        if isinstance(existing, dict) and "version_note" in existing:
+            record["version_note"] = existing["version_note"]
         records[key] = record
         self.index.parent.mkdir(parents=True, exist_ok=True)
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -140,6 +149,19 @@ class DocumentRoom:
             raise ValueError("document is not registered")
         record = records[relative_path]
         record["category"] = category.strip()
+        self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return record
+
+    def set_version_note(self, relative_path, note):
+        if not isinstance(relative_path, str):
+            raise ValueError("document path must be a string")
+        if not isinstance(note, str):
+            raise ValueError("version note must be a string")
+        records = self._load_validated_with_version_notes()
+        if relative_path not in records:
+            raise ValueError("document is not registered")
+        record = records[relative_path]
+        record["version_note"] = note.strip()
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
@@ -338,7 +360,8 @@ class DocumentRoom:
             return "unreadable"
 
     def export_manifest(self, release, tags=(), text="", include_references=False,
-                        archive_state="all", category=None, include_origins=False):
+                        archive_state="all", category=None, include_origins=False,
+                        include_version_notes=False):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
         self._check_archive_state(archive_state)
@@ -347,6 +370,8 @@ class DocumentRoom:
             raise ValueError("include_origins must be a boolean")
         if include_origins and not include_references:
             raise ValueError("include_origins requires include_references")
+        if not isinstance(include_version_notes, bool):
+            raise ValueError("include_version_notes must be a boolean")
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
 
@@ -356,7 +381,9 @@ class DocumentRoom:
                     and self._matches_archive_state(record, archive_state)
                     and self._matches_category(record, category))
 
-        if include_references or archive_state != "all" or category is not None:
+        if include_version_notes:
+            records = self._load_validated_with_version_notes()
+        elif include_references or archive_state != "all" or category is not None:
             records = self._load_validated_with_categories()
         else:
             records = self._load_validated()
@@ -406,6 +433,10 @@ class DocumentRoom:
                 document["origins"] = [
                     {"path": source, "distance": origins[record["path"]][source]}
                     for source in sorted(origins[record["path"]])]
+            if include_version_notes:
+                # Records written before this feature lack the field and
+                # export an empty note; referenced documents keep their own.
+                document["version_note"] = record.get("version_note", "")
             documents.append(document)
         return {"release": release,
                 "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
@@ -517,6 +548,9 @@ def main():
     category = commands.add_parser("category")
     category.add_argument("path")
     category.add_argument("--value", required=True)
+    note = commands.add_parser("note")
+    note.add_argument("path")
+    note.add_argument("--value", required=True)
     remove = commands.add_parser("remove")
     remove.add_argument("path")
     remove.add_argument("--detach", action="store_true")
@@ -535,6 +569,7 @@ def main():
     export.add_argument("--text", default="")
     export.add_argument("--with-references", action="store_true")
     export.add_argument("--with-origins", action="store_true")
+    export.add_argument("--with-version-notes", action="store_true")
     export.add_argument("--archive-state", default="all")
     export.add_argument("--category", default=None)
     compare = commands.add_parser("compare")
@@ -556,6 +591,8 @@ def main():
             result = room.set_archived(args.path, not args.restore)
         elif args.command == "category":
             result = room.set_category(args.path, args.value)
+        elif args.command == "note":
+            result = room.set_version_note(args.path, args.value)
         elif args.command == "remove":
             result = room.remove_record(args.path, detach=args.detach)
         elif args.command == "search":
@@ -585,7 +622,8 @@ def main():
                                           include_references=args.with_references,
                                           archive_state=args.archive_state,
                                           category=args.category,
-                                          include_origins=args.with_origins)
+                                          include_origins=args.with_origins,
+                                          include_version_notes=args.with_version_notes)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:

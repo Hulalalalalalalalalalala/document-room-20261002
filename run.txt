@@ -13,6 +13,8 @@ python3 document_room.py archive meeting.txt
 Marks a registered document archived (index only; --restore marks it active); search/export accept --archive-state all|active|archived, defaulting to all.
 python3 document_room.py category policy.md --value "Legal Team"
 Assigns a single category to a registered document (index only; an empty value marks it uncategorized); search/export accept --category to filter, and omitting it keeps every category.
+python3 document_room.py note policy.md --value "v2 draft"
+Attaches a free-form version note to a registered document (index only; a blank value clears it); export --with-version-notes adds each document's note to the manifest.
 python3 document_room.py remove meeting.txt --detach
 Unregisters one document's metadata record by exact index key (index only; the file is never touched); default mode is blocked while another record references it, and --detach clears those references first.
 python3 document_room.py export --release "Q4 Launch"
