@@ -1349,6 +1349,337 @@ class RemoveTests(unittest.TestCase):
         self.assertFalse((self.root / "fresh.json").exists())
 
 
+class RelocateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def record(self, path, **overrides):
+        record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                  "sha256": "hash-" + path, "tags": ["legal"]}
+        record.update(overrides)
+        return record
+
+    def move_meeting(self, destination, content="Notes\n"):
+        # Simulate the user moving the registered file themselves.
+        target = self.root / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        (self.root / "meeting.txt").unlink()
+        return target
+
+    def test_relocate_rewrites_key_and_all_references(self):
+        policy = self.room.add("policy.md", ["legal"])
+        meeting = self.room.add("meeting.txt", ["operations"])
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.move_meeting("docs/meeting.txt")
+        result = self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertEqual(result["before"], meeting)
+        after = result["after"]
+        self.assertEqual(after["path"], "docs/meeting.txt")
+        self.assertEqual(after["name"], "meeting.txt")
+        self.assertEqual(after["bytes"], meeting["bytes"])
+        self.assertEqual(after["sha256"], meeting["sha256"])
+        self.assertEqual(after["tags"], ["operations"])
+        self.assertEqual([r["path"] for r in result["updated"]], ["policy.md"])
+        updated_policy = result["updated"][0]
+        self.assertEqual(updated_policy["path"], "policy.md")
+        self.assertEqual(updated_policy["sha256"], policy["sha256"])
+        self.assertEqual(updated_policy["references"], ["docs/meeting.txt"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"policy.md", "docs/meeting.txt"})
+        self.assertNotIn("meeting.txt", stored)
+        self.assertEqual(stored["policy.md"]["references"], ["docs/meeting.txt"])
+        # Subsequent queries, impact and reference expansion use the new key.
+        self.assertEqual([r["path"] for r in self.room.search()],
+                         ["docs/meeting.txt", "policy.md"])
+        impact = self.room.reference_impact("docs/meeting.txt")
+        self.assertEqual([d["path"] for d in impact["documents"]], ["policy.md"])
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt")
+        self.assertEqual(set(self.room.export_records(tags=["legal"])),
+                         {"policy.md", "docs/meeting.txt"})
+        manifest = self.room.export_manifest("R1", include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["docs/meeting.txt", "policy.md"])
+        self.assertTrue(manifest["complete"])
+
+    def test_relocate_preserves_other_fields_and_missing_optionals(self):
+        meeting = self.room.add("meeting.txt", ["operations"])
+        self.room.set_archived("meeting.txt", True)
+        self.room.set_category("meeting.txt", "Ops")
+        self.room.set_version_note("meeting.txt", "v1")
+        self.room.set_references("meeting.txt", ["meeting.txt"])
+        self.room.add("policy.md", ["legal"])  # no references field
+        target = self.move_meeting("notes/archive.txt")
+        result = self.room.relocate_record("meeting.txt", "notes/archive.txt")
+        after = result["after"]
+        self.assertEqual(after["path"], "notes/archive.txt")
+        self.assertEqual(after["name"], "archive.txt")
+        self.assertEqual(after["bytes"], meeting["bytes"])
+        self.assertEqual(after["sha256"], meeting["sha256"])
+        self.assertEqual(after["tags"], ["operations"])
+        self.assertEqual(after["archived"], True)
+        self.assertEqual(after["category"], "Ops")
+        self.assertEqual(after["version_note"], "v1")
+        # The record's own self-reference is rewritten but it is not "updated".
+        self.assertEqual(after["references"], ["notes/archive.txt"])
+        self.assertEqual(result["updated"], [])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"policy.md", "notes/archive.txt"})
+        self.assertNotIn("references", stored["policy.md"])
+        self.assertTrue(target.is_file())
+
+    def test_relocate_preserves_extra_fields(self):
+        content = b"Notes\n"
+        record = {"path": "meeting.txt", "name": "meeting.txt", "bytes": len(content),
+                  "sha256": hashlib.sha256(content).hexdigest(), "tags": [],
+                  "custom": {"x": [1, 2]}}
+        self.room.import_records({"meeting.txt": record})
+        self.move_meeting("docs/meeting.txt")
+        result = self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertEqual(result["after"]["custom"], {"x": [1, 2]})
+        self.assertEqual(result["before"]["custom"], {"x": [1, 2]})
+
+    def test_relocate_self_references_and_cycles_stay_legal(self):
+        content = b"x" * 10
+        batch = {"a.md": self.record(
+                     "a.md", bytes=10,
+                     sha256=hashlib.sha256(content).hexdigest(),
+                     references=["b.md"]),
+                 "b.md": self.record("b.md", references=["a.md", "a.md"])}
+        self.room.import_records(batch)
+        target = self.root / "docs" / "a.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        result = self.room.relocate_record("a.md", "docs/a.md")
+        self.assertEqual(result["after"]["references"], ["b.md"])
+        self.assertEqual(result["updated"][0]["path"], "b.md")
+        self.assertEqual(result["updated"][0]["references"],
+                         ["docs/a.md", "docs/a.md"])
+        # The cycle still terminates during reference expansion.
+        expanded = self.room.export_manifest("R", include_references=True)
+        self.assertEqual([d["path"] for d in expanded["documents"]],
+                         ["b.md", "docs/a.md"])
+
+    def test_relocate_preserves_reference_order_duplicates_and_sort_order(self):
+        batch = {
+            "meeting.txt": self.record(
+                "meeting.txt", bytes=6,
+                sha256=hashlib.sha256(b"Notes\n").hexdigest(), tags=["operations"]),
+            "B.md": self.record("B.md", references=["meeting.txt", "meeting.txt"]),
+            "a.md": self.record("a.md",
+                                references=["meeting.txt", "c.md", "meeting.txt"],
+                                archived=True),
+            "c.md": self.record("c.md"),
+            "d.md": self.record("d.md", references=["c.md"]),
+        }
+        self.room.import_records(batch)
+        self.move_meeting("docs/meeting.txt")
+        result = self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertEqual([r["path"] for r in result["updated"]], ["B.md", "a.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["B.md"]["references"],
+                         ["docs/meeting.txt", "docs/meeting.txt"])
+        self.assertEqual(stored["a.md"]["references"],
+                         ["docs/meeting.txt", "c.md", "docs/meeting.txt"])
+        self.assertTrue(stored["a.md"]["archived"])
+        # Records without a replaced reference keep their arrays verbatim and
+        # are not listed.
+        self.assertEqual(stored["d.md"]["references"], ["c.md"])
+        self.assertFalse(any(r["path"] == "d.md" for r in result["updated"]))
+        self.assertNotIn("references", stored["c.md"])
+
+    def test_relocate_works_with_old_file_deleted_or_replaced(self):
+        self.room.add("meeting.txt")
+        target = self.root / "docs" / "meeting.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("Notes\n", encoding="utf-8")
+        # A different file now sitting at the old path is never read or checked.
+        (self.root / "meeting.txt").write_text("totally different", encoding="utf-8")
+        result = self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertEqual(result["after"]["path"], "docs/meeting.txt")
+        self.assertTrue((self.root / "meeting.txt").is_file())  # files never moved/deleted
+        self.assertTrue(target.is_file())
+
+    def test_relocate_canonicalizes_destination_path(self):
+        self.room.add("meeting.txt")
+        self.move_meeting("docs/meeting.txt")
+        (self.root / "docs" / "sub").mkdir(parents=True, exist_ok=True)
+        result = self.room.relocate_record("meeting.txt", "./docs/sub/../meeting.txt")
+        self.assertEqual(result["after"]["path"], "docs/meeting.txt")
+        self.assertEqual(result["after"]["name"], "meeting.txt")
+
+    def test_relocate_does_not_copy_move_or_delete_files(self):
+        self.room.add("policy.md")
+        self.room.add("meeting.txt")
+        target = self.root / "docs" / "meeting.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("Notes\n", encoding="utf-8")  # "copy", old file kept
+        self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertTrue((self.root / "meeting.txt").is_file())
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), b"Notes\n")
+
+    def test_relocate_path_and_registration_errors(self):
+        meeting = self.room.add("meeting.txt")
+        (self.root / "docs").mkdir(exist_ok=True)
+        (self.root / "docs" / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.room.add("docs/meeting.txt")
+        before = self.index.read_text(encoding="utf-8")
+        for source, destination in (
+                (None, "docs/meeting.txt"),
+                (7, "docs/meeting.txt"),
+                ("meeting.txt", None),
+                ("meeting.txt", 9),
+                ("MEETING.TXT", "docs/meeting.txt"),       # case-sensitive key
+                ("ghost.txt", "docs/meeting.txt"),         # unregistered source
+                ("meeting.txt", "docs/missing.txt"),       # destination missing
+                ("meeting.txt", "docs"),                   # destination is a directory
+                ("meeting.txt", "./meeting.txt"),          # canonical key == source key
+                ("meeting.txt", "docs/meeting.txt"),       # canonical key already registered
+        ):
+            with self.assertRaises(ValueError, msg=repr((source, destination))):
+                self.room.relocate_record(source, destination)
+            self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        self.assertEqual(json.loads(before)["meeting.txt"], meeting)
+
+    def test_relocate_rejects_outside_root_and_symlink_loop_without_reading(self):
+        self.room.add("meeting.txt")
+        before = self.index.read_text(encoding="utf-8")
+        outside = self.root.parent / "outside-secret-relocate.txt"
+        outside.write_text("outside root", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        escaped = self.root / "escape.txt"
+        escaped.symlink_to(outside)
+        for destination in ("../outside-secret-relocate.txt", "escape.txt"):
+            with self.assertRaises(ValueError, msg=destination):
+                self.room.relocate_record("meeting.txt", destination)
+        escaped.unlink()
+        # A symlink loop cannot be resolved.
+        loop_a = self.root / "a"
+        loop_b = self.root / "b"
+        loop_a.symlink_to("b")
+        loop_b.symlink_to("a")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "a")
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_relocate_content_mismatch_leaves_metadata_and_index_untouched(self):
+        meeting = self.room.add("meeting.txt")
+        before = self.index.read_text(encoding="utf-8")
+        # Different byte count and digest.
+        changed = self.root / "docs" / "meeting.txt"
+        changed.parent.mkdir(parents=True, exist_ok=True)
+        changed.write_text("much longer notes body", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        # Same byte count but different digest.
+        changed.write_text("NOTEZ\n", encoding="utf-8")
+        self.assertEqual(len(changed.read_bytes()), meeting["bytes"])
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        stored = json.loads(before)
+        self.assertEqual(stored["meeting.txt"]["bytes"], meeting["bytes"])
+        self.assertEqual(stored["meeting.txt"]["sha256"], meeting["sha256"])
+
+    def test_relocate_validates_whole_index_before_changes(self):
+        self.room.add("policy.md")
+        self.room.add("meeting.txt")
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.move_meeting("docs/meeting.txt")
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        # A dangling reference on an unrelated record invalidates relocation.
+        stored = json.loads(valid)
+        stored["policy.md"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        # A malformed field on an unrelated record does too.
+        stored = json.loads(valid)
+        stored["policy.md"]["bytes"] = "17"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        # A malformed optional field on the source record does too.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["archived"] = "yes"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.relocate_record("meeting.txt", "docs/meeting.txt")
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_relocate_without_index_raises_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        (self.root / "docs").mkdir()
+        with self.assertRaises(ValueError):
+            fresh.relocate_record("meeting.txt", "docs/meeting.txt")
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_cli_relocate_scenario(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        subprocess.run(prefix + ["add", "policy.md", "--tag", "legal"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "meeting.txt", "--tag", "operations"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["refs", "policy.md", "--to", "meeting.txt"],
+                       capture_output=True, check=True)
+        self.move_meeting("docs/meeting.txt")
+        result = subprocess.run(
+            prefix + ["relocate", "meeting.txt", "docs/meeting.txt"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["before"]["path"], "meeting.txt")
+        self.assertEqual(payload["after"]["path"], "docs/meeting.txt")
+        self.assertEqual([r["path"] for r in payload["updated"]], ["policy.md"])
+        # Reference expansion follows the rewritten key.
+        dumped = subprocess.run(prefix + ["dump", "--tag", "legal"],
+                                capture_output=True, text=True)
+        self.assertEqual(dumped.returncode, 0, dumped.stderr)
+        self.assertEqual(set(json.loads(dumped.stdout)),
+                         {"policy.md", "docs/meeting.txt"})
+        # The old key is unknown now: exit 2 with an error payload.
+        again = subprocess.run(
+            prefix + ["relocate", "meeting.txt", "docs/meeting.txt"],
+            capture_output=True, text=True)
+        self.assertEqual(again.returncode, 2)
+        self.assertIn("error", json.loads(again.stdout))
+        # A missing destination fails likewise and leaves the index in place.
+        failed = subprocess.run(
+            prefix + ["relocate", "docs/meeting.txt", "missing.txt"],
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        # A missing index reports the old key unregistered and creates nothing.
+        missing = [sys.executable, str(ROOT / "document_room.py"),
+                   "--root", str(self.root), "--index", str(self.root / "fresh.json")]
+        result = subprocess.run(missing + ["relocate", "meeting.txt", "docs/meeting.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        self.assertFalse((self.root / "fresh.json").exists())
+
+
 class ImportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
