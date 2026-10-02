@@ -11,4 +11,6 @@ python3 document_room.py search --tag legal
 Returns the policy metadata in a JSON array.
 python3 document_room.py export --release "Q4 Launch"
 Checks the registered files and reports ready, changed, missing, unsafe or unreadable; complete is true only when every listed document is ready.
+python3 document_room.py impact meeting.txt
+Lists registered documents that reference the target, each with its minimum reference-edge distance; --transitive also includes indirect referrers.
 python3 -B -m unittest -v

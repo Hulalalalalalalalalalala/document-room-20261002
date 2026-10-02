@@ -290,6 +290,123 @@ class DocumentRoomTests(unittest.TestCase):
         manifest = self.room.export_manifest("R1")
         self.assertEqual(len(manifest["documents"]), 2)
 
+    def test_reference_impact_direct_and_transitive_distances(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        (self.root / "notes.md").write_text("More\n", encoding="utf-8")
+        self.room.add("notes.md")
+        # a -> b -> c and d -> c
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_references("meeting.txt", ["notes.md"])
+        (self.root / "extra.txt").write_text("x\n", encoding="utf-8")
+        self.room.add("extra.txt")
+        self.room.set_references("extra.txt", ["notes.md"])
+        direct = self.room.reference_impact("notes.md")
+        self.assertEqual(direct["path"], "notes.md")
+        self.assertEqual([(d["path"], d["distance"]) for d in direct["documents"]],
+                         [("extra.txt", 1), ("meeting.txt", 1)])
+        transitive = self.room.reference_impact("notes.md", transitive=True)
+        self.assertEqual([(d["path"], d["distance"]) for d in transitive["documents"]],
+                         [("extra.txt", 1), ("meeting.txt", 1), ("policy.md", 2)])
+        self.assertTrue(all(d["distance"] == 1 for d in direct["documents"]))
+        # Each item is exactly the search record plus an integer distance.
+        by_path = {r["path"]: r for r in self.room.search()}
+        for document in transitive["documents"]:
+            distance = document.pop("distance")
+            self.assertIsInstance(distance, int)
+            self.assertEqual(document, by_path[document["path"]])
+
+    def test_reference_impact_excludes_target_self_reference_and_cycles(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        # Self-reference and a mutual cycle stay legal and terminate.
+        self.room.set_references("policy.md", ["meeting.txt", "policy.md"])
+        self.room.set_references("meeting.txt", ["policy.md"])
+        result = self.room.reference_impact("policy.md", transitive=True)
+        self.assertEqual([d["path"] for d in result["documents"]], ["meeting.txt"])
+        self.assertEqual(result["documents"][0]["distance"], 1)
+        # An existing document that nobody references yields an empty result.
+        (self.root / "lonely.txt").write_text("solo\n", encoding="utf-8")
+        self.room.add("lonely.txt")
+        self.assertEqual(self.room.reference_impact("lonely.txt", transitive=True)["documents"], [])
+
+    def test_reference_impact_reads_index_only(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        before = self.index.read_text(encoding="utf-8")
+        # Missing/changed source files do not affect the stored-graph result.
+        (self.root / "policy.md").unlink()
+        result = self.room.reference_impact("meeting.txt")
+        self.assertEqual([d["path"] for d in result["documents"]], ["policy.md"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_reference_impact_validation(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        for bad in (None, 7, ["meeting.txt"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.reference_impact(bad)
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt", transitive="yes")
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("MEETING.TXT")  # exact, case-sensitive key
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("ghost.md")
+        # Missing index: empty index, unregistered target, and no file created.
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.reference_impact("meeting.txt")
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_reference_impact_rejects_corrupt_index_even_unrelated(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        valid = self.index.read_text(encoding="utf-8")
+        # A dangling reference on an unrelated record still invalidates the query.
+        stored = json.loads(valid)
+        stored["policy.md"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("meeting.txt")
+        # An old record without references is treated as having none.
+        stored = json.loads(valid)
+        del stored["policy.md"]["references"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertEqual(self.room.reference_impact("meeting.txt")["documents"], [])
+        self.assertNotIn("references", json.loads(self.index.read_text(encoding="utf-8"))["policy.md"])
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.reference_impact("meeting.txt")
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_cli_impact_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        result = subprocess.run(prefix + ["impact", "meeting.txt"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["path"], "meeting.txt")
+        self.assertEqual([d["path"] for d in payload["documents"]], ["policy.md"])
+        self.assertEqual(payload["documents"][0]["distance"], 1)
+        result = subprocess.run(prefix + ["impact", "policy.md", "--transitive"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["documents"], [])
+        result = subprocess.run(prefix + ["impact", "ghost.md"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
     def test_cli_refs_and_export_with_references(self):
         prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
         self.room.add("policy.md", ["legal"])

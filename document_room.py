@@ -77,6 +77,34 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    def reference_impact(self, target, transitive=False):
+        if not isinstance(target, str):
+            raise ValueError("target path must be a string")
+        if not isinstance(transitive, bool):
+            raise ValueError("transitive must be a boolean")
+        records = self._load_validated_with_references()
+        if target not in records:
+            raise ValueError("target document is not registered")
+        referrers = {}
+        for source, record in records.items():
+            for referenced in record.get("references", []):
+                referrers.setdefault(referenced, set()).add(source)
+        distances = {}
+        frontier = [target]
+        depth = 0
+        while frontier and (transitive or depth == 0):
+            nxt = []
+            for node in frontier:
+                for source in referrers.get(node, ()):  # reverse reference edges
+                    if source != target and source not in distances:
+                        distances[source] = depth + 1
+                        nxt.append(source)
+            frontier = nxt
+            depth += 1
+        documents = [{**records[key], "distance": distances[key]}
+                     for key in sorted(distances, key=lambda key: (distances[key], key))]
+        return {"path": target, "documents": documents}
+
     def search(self, tags=(), text=""):
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
         return [record for _, record in sorted(self._load().items())
@@ -142,6 +170,9 @@ def main():
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
+    impact = commands.add_parser("impact")
+    impact.add_argument("path")
+    impact.add_argument("--transitive", action="store_true")
     export = commands.add_parser("export")
     export.add_argument("--release", default="")
     export.add_argument("--tag", action="append", default=[])
@@ -156,6 +187,8 @@ def main():
             result = room.search(args.tag, args.text)
         elif args.command == "refs":
             result = room.set_references(args.path, args.to)
+        elif args.command == "impact":
+            result = room.reference_impact(args.path, transitive=args.transitive)
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references)
