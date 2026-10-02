@@ -113,6 +113,34 @@ class DocumentRoom:
         return [record for _, record in sorted(self._load().items())
                 if wanted.issubset(record["tags"]) and text.casefold() in record["path"].casefold()]
 
+    def find_duplicates(self, tags=(), text=""):
+        if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must be a list or tuple of strings")
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        records = self._load_validated_with_references()
+        wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+
+        def matches(record):
+            return (wanted.issubset(record["tags"])
+                    and text.casefold() in record["path"].casefold())
+
+        buckets = {}
+        for record in records.values():
+            buckets.setdefault((record["bytes"], record["sha256"]), []).append(record)
+        groups = []
+        for (size, digest), members in buckets.items():
+            if len(members) < 2:  # duplicates need at least two distinct paths
+                continue
+            paths = sorted(record["path"] for record in members)
+            matched = [path for path in paths if matches(records[path])]
+            if not matched:  # a filter must hit at least one member to return the group
+                continue
+            groups.append({"bytes": size, "sha256": digest, "matched": matched,
+                           "documents": [records[path] for path in paths]})
+        groups.sort(key=lambda group: group["documents"][0]["path"])
+        return {"groups": groups}
+
     def _file_status(self, record):
         try:
             path = (self.root / record["path"]).resolve()
@@ -262,6 +290,9 @@ def main():
     impact = commands.add_parser("impact")
     impact.add_argument("path")
     impact.add_argument("--transitive", action="store_true")
+    duplicates = commands.add_parser("duplicates")
+    duplicates.add_argument("--tag", action="append", default=[])
+    duplicates.add_argument("--text", default="")
     export = commands.add_parser("export")
     export.add_argument("--release", default="")
     export.add_argument("--tag", action="append", default=[])
@@ -281,6 +312,8 @@ def main():
             result = room.set_references(args.path, args.to)
         elif args.command == "impact":
             result = room.reference_impact(args.path, transitive=args.transitive)
+        elif args.command == "duplicates":
+            result = room.find_duplicates(args.tag, args.text)
         elif args.command == "compare":
             result = room.compare_manifest_files(args.before, args.after)
         else:

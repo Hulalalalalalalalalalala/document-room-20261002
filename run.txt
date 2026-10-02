@@ -13,6 +13,8 @@ python3 document_room.py export --release "Q4 Launch"
 Checks the registered files and reports ready, changed, missing, unsafe or unreadable; complete is true only when every listed document is ready.
 python3 document_room.py impact meeting.txt
 Lists registered documents that reference the target, each with its minimum reference-edge distance; --transitive also includes indirect referrers.
+python3 document_room.py duplicates --tag release
+Groups registrations with equal stored bytes and SHA-256 into duplicate groups; --tag (repeatable) and --text filter like search and any member match returns the whole group.
 python3 document_room.py compare --before old.json --after new.json
 Diffs two exported manifest snapshots into added, removed, changed and unchanged documents without touching the index or files.
 python3 -B -m unittest -v

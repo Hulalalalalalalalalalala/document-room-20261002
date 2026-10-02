@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -404,6 +405,171 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["documents"], [])
         result = subprocess.run(prefix + ["impact", "ghost.md"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+    def test_find_duplicates_groups_by_bytes_and_sha256(self):
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "c.txt").write_text("different body\n", encoding="utf-8")
+        self.room.add("a.txt", ["release"])
+        self.room.add("b.txt")
+        self.room.add("c.txt")
+        result = self.room.find_duplicates()
+        self.assertEqual(set(result), {"groups"})
+        (group,) = result["groups"]
+        self.assertEqual(set(group), {"bytes", "sha256", "matched", "documents"})
+        self.assertEqual(group["bytes"], 10)
+        self.assertEqual(group["sha256"], hashlib.sha256(b"same body\n").hexdigest())
+        self.assertEqual(group["matched"], ["a.txt", "b.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+
+    def test_find_duplicates_filter_returns_whole_group(self):
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        first = self.room.add("a.txt", ["release"])
+        second = self.room.add("b.txt", ["draft"])
+        # Filtering by a tag only a.txt carries still returns the whole group,
+        # but matched lists only the member that matched.
+        group = self.room.find_duplicates([" RELEASE "])["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual(group["documents"], [first, second])
+        self.assertEqual(
+            self.room.find_duplicates(text="B.TXT")["groups"][0]["matched"], ["b.txt"])
+        # A tag no member carries yields nothing.
+        self.assertEqual(self.room.find_duplicates(["finance"]), {"groups": []})
+        # Intersection of tags is required on the matching member.
+        self.assertEqual(self.room.find_duplicates(["release", "draft"]), {"groups": []})
+
+    def test_find_duplicates_requires_both_bytes_and_sha256(self):
+        # Same size or same digest alone never groups records; name is ignored.
+        records = [
+            {"path": "one.txt", "name": "one.txt", "bytes": 5, "sha256": "h1", "tags": []},
+            {"path": "two.txt", "name": "two.txt", "bytes": 5, "sha256": "h2", "tags": []},
+            {"path": "three.txt", "name": "one.txt", "bytes": 6, "sha256": "h1", "tags": []},
+        ]
+        self.index.write_text(json.dumps({r["path"]: r for r in records}), encoding="utf-8")
+        self.assertEqual(self.room.find_duplicates(), {"groups": []})
+        # A second identical copy forms one group with the first.
+        records.append({"path": "mid.txt", "name": "mid.txt", "bytes": 5, "sha256": "h1", "tags": []})
+        self.index.write_text(json.dumps({r["path"]: r for r in records}), encoding="utf-8")
+        group = self.room.find_duplicates()["groups"][0]
+        self.assertEqual([d["path"] for d in group["documents"]], ["mid.txt", "one.txt"])
+        self.assertEqual(group["matched"], ["mid.txt", "one.txt"])
+
+    def test_find_duplicates_sorts_groups_by_smallest_member(self):
+        groups_data = [
+            ("z1.txt", "z2.txt", "zz"), ("a1.txt", "a2.txt", "aa"),
+            ("m1.txt", "m2.txt", "mm"),
+        ]
+        for first, second, body in groups_data:
+            (self.root / first).write_text(body, encoding="utf-8")
+            (self.root / second).write_text(body, encoding="utf-8")
+            self.room.add(first)
+            self.room.add(second)
+        result = self.room.find_duplicates()
+        self.assertEqual([g["documents"][0]["path"] for g in result["groups"]],
+                         ["a1.txt", "m1.txt", "z1.txt"])
+        # A text filter that only hits a member of one group returns just it.
+        result = self.room.find_duplicates(text="M2")
+        self.assertEqual([d["path"] for d in result["groups"][0]["documents"]],
+                         ["m1.txt", "m2.txt"])
+
+    def test_find_duplicates_keeps_stored_fields_and_reads_index_only(self):
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("a.txt", ["release"])
+        self.room.add("b.txt")
+        self.room.set_references("a.txt", ["b.txt"])
+        before = self.index.read_text(encoding="utf-8")
+        # The stored references field is passed through; no status field is added.
+        group = self.room.find_duplicates()["groups"][0]
+        self.assertEqual(group["documents"][0]["references"], ["b.txt"])
+        self.assertNotIn("status", group["documents"][0])
+        self.assertNotIn("references", group["documents"][1])
+        # Changing or removing live files does not change the index-based result.
+        expected = self.room.find_duplicates()
+        (self.root / "a.txt").write_text("totally changed now", encoding="utf-8")
+        (self.root / "b.txt").unlink()
+        self.assertEqual(self.room.find_duplicates(), expected)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_find_duplicates_without_index_returns_empty_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.find_duplicates(), {"groups": []})
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_find_duplicates_validation(self):
+        self.room.add("policy.md")
+        for bad in (None, 7, "legal", {"x"}, [1], [None]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_duplicates(bad)
+        for bad in (None, 7, ["x"], b"x"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_duplicates(text=bad)
+
+    def test_find_duplicates_rejects_corrupt_index_even_unrelated(self):
+        (self.root / "a.txt").write_text("x", encoding="utf-8")
+        (self.root / "b.txt").write_text("x", encoding="utf-8")
+        self.room.add("a.txt")
+        self.room.add("b.txt")
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates()
+        # A malformed record never matched by a filter still invalidates the query.
+        stored = json.loads(valid)
+        stored["a.txt"]["sha256"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates(text="zzz")
+        # A dangling reference also invalidates the whole index.
+        stored = json.loads(valid)
+        stored["a.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates()
+        # Old records without references stay legal.
+        self.index.write_text(valid, encoding="utf-8")
+        self.assertEqual(len(self.room.find_duplicates()["groups"]), 1)
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.find_duplicates()
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_find_duplicates_does_not_mutate_records(self):
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("a.txt", ["release"])
+        self.room.add("b.txt")
+        snapshot = self.index.read_text(encoding="utf-8")
+        self.room.find_duplicates(["release"], "a")
+        self.assertEqual(self.index.read_text(encoding="utf-8"), snapshot)
+
+    def test_cli_duplicates_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        self.room.add("a.txt", ["release"])
+        self.room.add("b.txt")
+        result = subprocess.run(prefix + ["duplicates", "--tag", "RELEASE", "--text", "a.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        group = json.loads(result.stdout)["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+        # No duplicates: empty groups payload, still exit 0.
+        (self.root / "b.txt").write_text("different", encoding="utf-8")
+        self.room.add("b.txt")
+        result = subprocess.run(prefix + ["duplicates"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"groups": []})
+        # A corrupt index is reported as an error payload with exit 2.
+        self.index.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["duplicates"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("error", json.loads(result.stdout))
 
