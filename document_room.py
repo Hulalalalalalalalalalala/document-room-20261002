@@ -165,6 +165,47 @@ class DocumentRoom:
         self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return record
 
+    @staticmethod
+    def _normalize_tags(tags):
+        return {tag.strip().lower() for tag in tags if tag.strip()}
+
+    def edit_tags(self, paths, add_tags=(), remove_tags=()):
+        if not isinstance(paths, (list, tuple)):
+            raise ValueError("paths must be a list or tuple of strings")
+        if not isinstance(add_tags, (list, tuple)):
+            raise ValueError("add_tags must be a list or tuple of strings")
+        if not isinstance(remove_tags, (list, tuple)):
+            raise ValueError("remove_tags must be a list or tuple of strings")
+        if (not all(isinstance(path, str) for path in paths)
+                or not all(isinstance(tag, str) for tag in add_tags)
+                or not all(isinstance(tag, str) for tag in remove_tags)):
+            raise ValueError("paths and tags must contain only strings")
+        # The whole index must be structurally sound before anything changes.
+        records = self._load_validated_with_version_notes()
+        unique_paths = list(dict.fromkeys(paths))  # duplicates handled once, first occurrence wins
+        for path in unique_paths:
+            if path not in records:
+                raise ValueError("document is not registered: " + path)
+        added = self._normalize_tags(add_tags)
+        removed = self._normalize_tags(remove_tags)
+        if added & removed:
+            raise ValueError("add_tags and remove_tags overlap after normalization")
+        updated = []
+        unchanged = []
+        for path in sorted(unique_paths):
+            record = records[path]
+            new_tags = sorted((self._normalize_tags(record["tags"]) - removed) | added)
+            if new_tags == record["tags"]:
+                unchanged.append(path)
+            else:  # only the tags array changes; every other field stays as stored
+                record["tags"] = new_tags
+                updated.append(record)
+        if updated:
+            self.index.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+        return {"updated": updated,
+                "unchanged": unchanged}
+
     def remove_record(self, relative_path, detach=False):
         if not isinstance(relative_path, str):
             raise ValueError("document path must be a string")
@@ -626,6 +667,10 @@ def main():
     remove = commands.add_parser("remove")
     remove.add_argument("path")
     remove.add_argument("--detach", action="store_true")
+    tag_edit = commands.add_parser("tags")
+    tag_edit.add_argument("paths", nargs="*")
+    tag_edit.add_argument("--add", action="append", default=[])
+    tag_edit.add_argument("--remove", action="append", default=[])
     relocate = commands.add_parser("relocate")
     relocate.add_argument("source")
     relocate.add_argument("destination")
@@ -671,6 +716,11 @@ def main():
             result = room.set_version_note(args.path, args.value)
         elif args.command == "remove":
             result = room.remove_record(args.path, detach=args.detach)
+        elif args.command == "tags":
+            if not args.paths:
+                raise ValueError("at least one path is required")
+            result = room.edit_tags(args.paths, add_tags=args.add,
+                                    remove_tags=args.remove)
         elif args.command == "relocate":
             result = room.relocate_record(args.source, args.destination)
         elif args.command == "search":

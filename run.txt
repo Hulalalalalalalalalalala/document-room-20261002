@@ -17,6 +17,8 @@ python3 document_room.py note policy.md --value "v2 draft"
 Attaches a free-form version note to a registered document (index only; a blank value clears it); export --with-version-notes adds each document's note to the manifest.
 python3 document_room.py remove meeting.txt --detach
 Unregisters one document's metadata record by exact index key (index only; the file is never touched); default mode is blocked while another record references it, and --detach clears those references first.
+python3 document_room.py tags policy.md meeting.txt --add legal --add release --remove draft
+Batch-edits stored tags by exact index key (index only; files are never read): repeatable --add/--remove are trimmed and lowercased like add tags, the result is sorted and de-duplicated, overlap after normalization or any unregistered path fails the whole batch, printing updated full records and unchanged paths; at least one path is required.
 python3 document_room.py relocate meeting.txt docs/meeting.txt
 Moves a registration from the old exact index key to the new file's canonical root-relative path after you move the file yourself (index only; the file must exist inside the root with the same bytes and SHA-256); all references, including self-references, are rewritten to the new key, printing before, after and updated.
 python3 document_room.py export --release "Q4 Launch"

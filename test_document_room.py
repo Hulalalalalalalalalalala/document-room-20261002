@@ -2346,5 +2346,284 @@ class RelocateTests(unittest.TestCase):
         self.assertFalse((self.root / "fresh.json").exists())
 
 
+class EditTagsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for name in ("a.md", "b.md", "c.md"):
+            (self.root / name).write_text(f"Content of {name}\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def record(self, path, tags=(), **overrides):
+        record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                  "sha256": "hash-" + path, "tags": list(tags)}
+        record.update(overrides)
+        return record
+
+    def _register_three(self):
+        a = self.room.add("a.md", ["legal", "policy"])
+        b = self.room.add("b.md", ["operations"])
+        c = self.room.add("c.md", [])
+        return a, b, c
+
+    def test_batch_add_remove_normalizes_and_sorts(self):
+        self._register_three()
+        result = self.room.edit_tags(["c.md", "a.md"],
+                                     add_tags=[" Finance ", "LEGAL", "legal"],
+                                     remove_tags=[" Policy "])
+        self.assertEqual([r["path"] for r in result["updated"]], ["a.md", "c.md"])
+        self.assertEqual(result["updated"][0]["tags"], ["finance", "legal"])
+        self.assertEqual(result["updated"][1]["tags"], ["finance", "legal"])
+        self.assertEqual(result["unchanged"], [])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["a.md"]["tags"], ["finance", "legal"])
+        self.assertEqual(stored["c.md"]["tags"], ["finance", "legal"])
+        # The unselected record keeps its tags verbatim.
+        self.assertEqual(stored["b.md"]["tags"], ["operations"])
+
+    def test_adding_existing_and_removing_absent_is_unchanged(self):
+        self._register_three()
+        result = self.room.edit_tags(["a.md", "b.md"],
+                                     add_tags=["LEGAL", " legal "],
+                                     remove_tags=["ghost", "  "])
+        # a.md already has legal: its set is unchanged, so it is not rewritten.
+        # b.md gains legal; removing a tag it never had is allowed.
+        self.assertEqual([r["path"] for r in result["updated"]], ["b.md"])
+        self.assertEqual(result["updated"][0]["tags"], ["legal", "operations"])
+        self.assertEqual(result["unchanged"], ["a.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["a.md"]["tags"], ["legal", "policy"])
+        # Running again changes nothing and does not rewrite the index.
+        mtime = self.index.stat().st_mtime_ns
+        again = self.room.edit_tags(["b.md"], add_tags=["legal"], remove_tags=["x"])
+        self.assertEqual(again, {"updated": [], "unchanged": ["b.md"]})
+        self.assertEqual(self.index.stat().st_mtime_ns, mtime)
+
+    def test_normalization_only_change_counts_as_updated(self):
+        batch = {"a.md": self.record("a.md", tags=[" Legal ", "POLICY", "legal", "b"]),
+                 "b.md": self.record("b.md", tags=["b"])}
+        self.room.import_records(batch)
+        result = self.room.edit_tags(["a.md"], add_tags=[], remove_tags=[])
+        self.assertEqual([r["path"] for r in result["updated"]], ["a.md"])
+        self.assertEqual(result["updated"][0]["tags"], ["b", "legal", "policy"])
+        self.assertEqual(result["unchanged"], [])
+
+    def test_duplicate_paths_processed_once_and_sorted(self):
+        self._register_three()
+        result = self.room.edit_tags(["c.md", "a.md", "c.md", "b.md", "a.md"],
+                                     add_tags=["x"])
+        self.assertEqual([r["path"] for r in result["updated"]],
+                         ["a.md", "b.md", "c.md"])
+        paths = result["unchanged"] + [r["path"] for r in result["updated"]]
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertEqual(paths, ["a.md", "b.md", "c.md"])
+
+    def test_empty_paths_returns_empty_arrays_without_index(self):
+        result = self.room.edit_tags([])
+        self.assertEqual(result, {"updated": [], "unchanged": []})
+        self.assertFalse(self.index.exists())
+        # Non-empty paths against a missing index fail and still create nothing.
+        with self.assertRaises(ValueError):
+            self.room.edit_tags(["a.md"], add_tags=["x"])
+        self.assertFalse(self.index.exists())
+
+    def test_other_fields_and_missing_field_state_preserved(self):
+        a, b, c = self._register_three()
+        self.room.set_references("a.md", ["b.md", "a.md"])
+        self.room.set_category("a.md", "Legal Team")
+        self.room.set_version_note("a.md", "v1")
+        self.room.set_archived("b.md", True)
+        result = self.room.edit_tags(["a.md", "b.md"], add_tags=["z"],
+                                     remove_tags=["legal"])
+        edited_a, edited_b = result["updated"]
+        self.assertEqual(edited_a["references"], ["a.md", "b.md"])
+        self.assertEqual(edited_a["category"], "Legal Team")
+        self.assertEqual(edited_a["version_note"], "v1")
+        self.assertNotIn("archived", edited_a)
+        self.assertIs(edited_b["archived"], True)
+        self.assertNotIn("references", edited_b)
+        self.assertNotIn("category", edited_b)
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        # Unselected c.md is completely untouched, byte-identical to what add wrote.
+        self.assertEqual(stored["c.md"], c)
+
+    def test_index_only_works_when_files_missing_or_changed(self):
+        self._register_three()
+        (self.root / "a.md").unlink()
+        (self.root / "b.md").write_text("totally different now", encoding="utf-8")
+        os.chmod(self.root / "c.md", 0)
+        try:
+            result = self.room.edit_tags(["a.md", "b.md", "c.md"], add_tags=["x"])
+        finally:
+            os.chmod(self.root / "c.md", 0o644)
+        self.assertEqual([r["path"] for r in result["updated"]],
+                         ["a.md", "b.md", "c.md"])
+        # bytes and sha256 keep their registered values; files were never read.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["b.md"]["bytes"], 16)
+        self.assertTrue((self.root / "b.md").is_file())
+
+    def test_overlapping_add_remove_raises_after_normalization(self):
+        self._register_three()
+        before = self.index.read_text(encoding="utf-8")
+        for add, remove in ((["Legal"], [" legal "]),
+                            ([" A ", "b"], ["a"]),
+                            (["x", ""], ["x"])):
+            with self.assertRaises(ValueError, msg=repr((add, remove))):
+                self.room.edit_tags(["a.md"], add_tags=add, remove_tags=remove)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_argument_types_validated(self):
+        self._register_three()
+        # paths must be a list or tuple of strings; a bare string is rejected.
+        for bad_paths in ("a.md", None, 7, {}):
+            with self.assertRaises(ValueError, msg=repr(bad_paths)):
+                self.room.edit_tags(bad_paths)
+        # add_tags/remove_tags must be lists or tuples of strings.
+        for bad_tags in ("legal", None, 7, {}, ["legal", 7], [None],
+                         [b"legal"], (True,)):
+            with self.assertRaises(ValueError, msg=repr(bad_tags)):
+                self.room.edit_tags(["a.md"], add_tags=bad_tags)
+            with self.assertRaises(ValueError, msg=repr(bad_tags)):
+                self.room.edit_tags(["a.md"], remove_tags=bad_tags)
+        with self.assertRaises(ValueError):
+            self.room.edit_tags(["a.md", 7], add_tags=["x"])
+
+    def test_unregistered_or_case_mismatched_path_raises_batch_atomically(self):
+        self._register_three()
+        before = self.index.read_text(encoding="utf-8")
+        for paths in (["ghost.md"], ["a.md", "ghost.md"],
+                      ["A.MD"], ["ghost.md", "a.md"]):
+            with self.assertRaises(ValueError, msg=repr(paths)):
+                self.room.edit_tags(paths, add_tags=["x"])
+        # Even the valid first path is unchanged: validation fails the whole batch.
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_whole_index_validated_even_unselected(self):
+        self._register_three()
+        valid = self.index.read_text(encoding="utf-8")
+
+        def expect_value_error():
+            with self.assertRaises(ValueError):
+                self.room.edit_tags(["a.md"], add_tags=["x"])
+
+        self.index.write_text("{not json", encoding="utf-8")
+        expect_value_error()
+        self.index.write_bytes(b"\xff\xfe{}")
+        expect_value_error()
+        # A malformed unrelated record fails even though only a.md is selected.
+        for mutate in (
+                lambda s: s["b.md"].update(bytes="10"),
+                lambda s: s["b.md"].update(sha256=5),
+                lambda s: s["b.md"].update(tags="legal"),
+                lambda s: s["b.md"].update(tags=["legal", 1]),
+                lambda s: s["b.md"].update(name=7),
+                lambda s: s["b.md"].update(path="elsewhere.md"),
+                lambda s: s["c.md"].update(archived="yes"),
+                lambda s: s["c.md"].update(category=7),
+                lambda s: s["c.md"].update(version_note=7),
+                lambda s: s["b.md"].update(references="c.md"),
+                lambda s: s["b.md"].update(references=[1]),
+                lambda s: s["b.md"].update(references=["ghost.md"])):
+            stored = json.loads(valid)
+            mutate(stored)
+            self.index.write_text(json.dumps(stored), encoding="utf-8")
+            expect_value_error()
+        stored = json.loads(valid)
+        stored["extra.md"] = ["not", "a", "record"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        expect_value_error()
+        self.index.write_text(json.dumps([1, 2]), encoding="utf-8")
+        expect_value_error()
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.edit_tags(["a.md"], add_tags=["x"])
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_unchanged_batch_does_not_write_index(self):
+        self._register_three()
+        before = self.index.read_text(encoding="utf-8")
+        result = self.room.edit_tags(["b.md"], add_tags=["operations"],
+                                     remove_tags=["nope"])
+        self.assertEqual(result, {"updated": [], "unchanged": ["b.md"]})
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_existing_entry_points_use_edited_tags(self):
+        self._register_three()
+        self.room.set_references("a.md", ["c.md"])
+        self.room.edit_tags(["a.md", "b.md", "c.md"],
+                            add_tags=["release"], remove_tags=["operations"])
+        self.assertEqual([r["path"] for r in self.room.search(["RELEASE"])],
+                         ["a.md", "b.md", "c.md"])
+        self.assertEqual(self.room.search(["operations"]), [])
+        self.assertEqual(self.room.find_duplicates(["release"])["groups"], [])
+        dumped = self.room.export_records(tags=["release"])
+        self.assertEqual(sorted(dumped), ["a.md", "b.md", "c.md"])
+        manifest = self.room.export_manifest("R1", ["legal"], include_references=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(set(by_path), {"a.md", "c.md"})
+        self.assertTrue(all("release" in d["tags"] for d in manifest["documents"]))
+
+    def test_add_refresh_behavior_unchanged_after_edit(self):
+        a, _, _ = self._register_three()
+        self.room.edit_tags(["a.md"], add_tags=["finance"])
+        (self.root / "a.md").write_text("longer changed body\n", encoding="utf-8")
+        again = self.room.add("a.md", ["legal"])
+        self.assertEqual(again["tags"], ["legal"])
+        self.assertNotEqual(again["bytes"], a["bytes"])
+        self.assertNotIn("finance", again["tags"])
+
+    def test_cli_tags_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        subprocess.run(prefix + ["add", "a.md", "--tag", "legal", "--tag", "policy"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "b.md", "--tag", "operations"],
+                       capture_output=True, check=True)
+        result = subprocess.run(
+            prefix + ["tags", "b.md", "a.md", "--add", " Finance ",
+                      "--add", "LEGAL", "--remove", "POLICY", "--remove", "ghost"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual([r["path"] for r in payload["updated"]], ["a.md", "b.md"])
+        self.assertEqual(payload["updated"][0]["tags"], ["finance", "legal"])
+        self.assertEqual(payload["updated"][1]["tags"],
+                         ["finance", "legal", "operations"])
+        self.assertEqual(payload["unchanged"], [])
+        # Search through the CLI uses the new values.
+        found = subprocess.run(prefix + ["search", "--tag", "FINANCE"],
+                               capture_output=True, text=True)
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual([r["path"] for r in json.loads(found.stdout)],
+                         ["a.md", "b.md"])
+        # No paths: error JSON with exit 2.
+        result = subprocess.run(prefix + ["tags", "--add", "x"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # Unregistered path and overlap: error JSON with exit 2.
+        result = subprocess.run(prefix + ["tags", "ghost.md", "--add", "x"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        result = subprocess.run(prefix + ["tags", "a.md", "--add", "x",
+                                          "--remove", " X "],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # A corrupt index is reported with exit 2.
+        self.index.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["tags", "a.md", "--add", "x"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+
 if __name__ == "__main__":
     unittest.main()
