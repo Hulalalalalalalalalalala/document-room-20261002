@@ -2034,6 +2034,314 @@ class ManifestComparisonTests(unittest.TestCase):
                              {"before.json", "after.json", "bad.json", "utf8.json"})
 
 
+class RelocationDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "root"
+        self.root.mkdir()
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root.parent / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def _register_pair(self):
+        policy = self.room.add("policy.md", ["legal"])
+        meeting = self.room.add("meeting.txt", ["operations"])
+        return policy, meeting
+
+    def _manifest_files(self, before, after):
+        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temp.cleanup)
+        before_path = Path(temp.name) / "before.json"
+        after_path = Path(temp.name) / "after.json"
+        before_path.write_text(json.dumps(before), encoding="utf-8")
+        after_path.write_text(json.dumps(after), encoding="utf-8")
+        return before_path, after_path
+
+    def doc(self, path, content=("hash-c", 10), **overrides):
+        digest, size = content
+        document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": size,
+                    "sha256": digest, "tags": ["a"], "status": "ready"}
+        document.update(overrides)
+        return document
+
+    def manifest(self, documents, release="R1", complete=True):
+        return {"release": release, "complete": complete, "documents": documents}
+
+    def test_exported_manifests_detect_meeting_relocation_to_minutes(self):
+        _, meeting = self._register_pair()
+        before = self.room.export_manifest("R1")
+        target = self.root / "docs" / "minutes.txt"
+        target.parent.mkdir(parents=True)
+        (self.root / "meeting.txt").replace(target)
+        self.room.relocate_record("meeting.txt", "docs/minutes.txt")
+        after = self.room.export_manifest("R1")
+        before_path, after_path = self._manifest_files(before, after)
+        # The comparison reads the offline snapshots only.
+        default = DocumentRoom.compare_manifest_files(before_path, after_path)
+        self.assertEqual(set(default),
+                         {"before", "after", "added", "removed", "changed", "unchanged"})
+        self.assertNotIn("relocated", default)
+        result = DocumentRoom.compare_manifest_files(before_path, after_path,
+                                                     detect_relocations=True)
+        self.assertEqual(
+            result,
+            DocumentRoom.compare_manifests(before, after, detect_relocations=True))
+        self.assertEqual(result["unchanged"], ["policy.md"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(len(result["relocated"]), 1)
+        item = result["relocated"][0]
+        before_by_path = {d["path"]: d for d in before["documents"]}
+        after_by_path = {d["path"]: d for d in after["documents"]}
+        self.assertEqual(item["before"], before_by_path["meeting.txt"])
+        self.assertEqual(item["after"], after_by_path["docs/minutes.txt"])
+        self.assertEqual(item["before"]["bytes"], meeting["bytes"])
+        self.assertEqual(item["before"]["sha256"], meeting["sha256"])
+        # Only the path and the file name changed; fields are sorted by name.
+        self.assertEqual(item["fields"], ["name", "path"])
+
+    def test_two_identical_old_leftovers_keep_removed_and_added(self):
+        (self.root / "copy.txt").write_text("Notes\n", encoding="utf-8")
+        self.room.add("meeting.txt", ["operations"])
+        self.room.add("policy.md", ["legal"])
+        self.room.add("copy.txt")
+        before = self.room.export_manifest("R1")
+        # The second same-content old path is gone from the second manifest too.
+        self.room.remove_record("copy.txt")
+        target = self.root / "docs" / "minutes.txt"
+        target.parent.mkdir(parents=True)
+        (self.root / "meeting.txt").replace(target)
+        self.room.relocate_record("meeting.txt", "docs/minutes.txt")
+        after = self.room.export_manifest("R1")
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]],
+                         ["copy.txt", "meeting.txt"])
+        self.assertEqual([d["path"] for d in result["added"]], ["docs/minutes.txt"])
+
+    def test_disabled_flag_keeps_structure_and_semantics(self):
+        before = self.manifest([self.doc("old.md"), self.doc("same.md")])
+        after = self.manifest([self.doc("new.md"), self.doc("same.md")])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(set(result),
+                         {"before", "after", "added", "removed", "changed", "unchanged"})
+        self.assertEqual([d["path"] for d in result["removed"]], ["old.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["new.md"])
+        # Passing False explicitly is identical to omitting the flag.
+        self.assertEqual(DocumentRoom.compare_manifests(before, after,
+                                                        detect_relocations=False),
+                         result)
+
+    def test_no_candidates_yields_empty_relocated(self):
+        before = self.manifest([self.doc("old.md", ("h1", 1))])
+        after = self.manifest([self.doc("new.md", ("h2", 1))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["old.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["new.md"])
+        empty = DocumentRoom.compare_manifests(self.manifest([]), self.manifest([]),
+                                              detect_relocations=True)
+        self.assertEqual(empty["relocated"], [])
+
+    def test_single_candidate_merged_with_sorted_fields(self):
+        before = self.manifest([self.doc("meeting.txt", ("h1", 6), tags=["ops"])])
+        after = self.manifest([
+            self.doc("docs/meeting.txt", ("h1", 6), tags=["ops"])])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(len(result["relocated"]), 1)
+        item = result["relocated"][0]
+        self.assertEqual(item["before"], before["documents"][0])
+        self.assertEqual(item["after"], after["documents"][0])
+        self.assertEqual(item["fields"], ["path"])  # identical name
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+
+    def test_fields_follow_compare_rules_for_tags_status_and_name(self):
+        before = self.manifest([
+            self.doc("a/notes.txt", ("h1", 6), name="notes.txt",
+                     tags=["B", "a"], status="ready", note="old")])
+        after = self.manifest([
+            self.doc("b/minutes.md", ("h1", 6), name="minutes.md",
+                     tags=["a", "a", "b"], status="missing", note="new")],
+            complete=False)
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        item = result["relocated"][0]
+        # Tags compare as case-sensitive sets, so ["B","a"] vs ["a","b"] differ;
+        # the extra note field is preserved but never compared.
+        self.assertEqual(item["fields"], ["name", "path", "status", "tags"])
+        self.assertEqual(item["before"]["note"], "old")
+        self.assertEqual(item["after"]["note"], "new")
+        self.assertEqual(result["relocated"][0]["fields"],
+                         sorted(result["relocated"][0]["fields"]))
+
+    def test_bytes_and_sha256_must_match_exactly_without_case_folding(self):
+        # Same bytes but a differently cased digest never matches.
+        before = self.manifest([self.doc("a.md", ("ABC", 6))])
+        after = self.manifest([self.doc("b.md", ("abc", 6))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        # Same digest but different byte count never matches either.
+        before = self.manifest([self.doc("a.md", ("h", 6))])
+        after = self.manifest([self.doc("b.md", ("h", 7))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["a.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["b.md"])
+
+    def test_ambiguous_groups_on_either_side_stay_classified(self):
+        # Two old leftovers, one new leftover with the same content.
+        before = self.manifest([self.doc("a1.md", ("h", 1)),
+                                self.doc("a2.md", ("h", 1))])
+        after = self.manifest([self.doc("b.md", ("h", 1))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["a1.md", "a2.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["b.md"])
+        # One old leftover, two new leftovers.
+        before = self.manifest([self.doc("a.md", ("h", 1))])
+        after = self.manifest([self.doc("b1.md", ("h", 1)),
+                               self.doc("b2.md", ("h", 1))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual(result["relocated"], [])
+        self.assertEqual([d["path"] for d in result["removed"]], ["a.md"])
+        self.assertEqual([d["path"] for d in result["added"]], ["b1.md", "b2.md"])
+
+    def test_common_paths_never_count_toward_uniqueness(self):
+        # The shared document carries the same content as the leftovers, yet
+        # the unique old/new leftovers still merge.
+        before = self.manifest([self.doc("meeting.txt", ("h", 1)),
+                                self.doc("shared.md", ("h", 1), status="ready")])
+        after = self.manifest([self.doc("docs/meeting.txt", ("h", 1)),
+                               self.doc("shared.md", ("h", 1), status="changed")],
+                              complete=False)
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual([d["path"] for d in result["removed"]], [])
+        self.assertEqual([d["path"] for d in result["added"]], [])
+        self.assertEqual([c["path"] for c in result["changed"]], ["shared.md"])
+        self.assertEqual(len(result["relocated"]), 1)
+        self.assertEqual(result["relocated"][0]["before"]["path"], "meeting.txt")
+        self.assertEqual(result["relocated"][0]["after"]["path"],
+                         "docs/meeting.txt")
+
+    def test_relocations_sorted_by_old_then_new_path(self):
+        before = self.manifest([
+            self.doc("z/old.md", ("h1", 1)), self.doc("b/old.md", ("h2", 2)),
+            self.doc("m/old.md", ("h3", 3))])
+        after = self.manifest([
+            self.doc("a/new.md", ("h1", 1)), self.doc("m/new.md", ("h2", 2)),
+            self.doc("c/new.md", ("h3", 3))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        self.assertEqual([(i["before"]["path"], i["after"]["path"])
+                          for i in result["relocated"]],
+                         [("b/old.md", "m/new.md"),
+                          ("m/old.md", "c/new.md"),
+                          ("z/old.md", "a/new.md")])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        # Manifest document order must not influence the result.
+        shuffled = self.manifest(list(reversed(after["documents"])))
+        again = DocumentRoom.compare_manifests(before, shuffled,
+                                               detect_relocations=True)
+        self.assertEqual(again, result)
+
+    def test_each_document_belongs_to_exactly_one_category(self):
+        before = self.manifest([
+            self.doc("gone.md", ("h1", 1)), self.doc("moved.md", ("h2", 2)),
+            self.doc("kept.md", ("h3", 3))])
+        after = self.manifest([
+            self.doc("landed.md", ("h2", 2)), self.doc("kept.md", ("h3", 3)),
+            self.doc("fresh.md", ("h4", 4))])
+        result = DocumentRoom.compare_manifests(before, after,
+                                                detect_relocations=True)
+        seen = set()
+        for document in result["added"] + result["removed"]:
+            self.assertNotIn(document["path"], seen)
+            seen.add(document["path"])
+        for item in result["relocated"]:
+            self.assertNotIn(item["before"]["path"], seen)
+            self.assertNotIn(item["after"]["path"], seen)
+            seen.add(item["before"]["path"])
+            seen.add(item["after"]["path"])
+        self.assertNotIn("kept.md", seen)  # unchanged paths stay unchanged
+        self.assertEqual([d["path"] for d in result["added"]], ["fresh.md"])
+        self.assertEqual([d["path"] for d in result["removed"]], ["gone.md"])
+        self.assertEqual([(i["before"]["path"], i["after"]["path"])
+                          for i in result["relocated"]],
+                         [("moved.md", "landed.md")])
+
+    def test_non_boolean_switch_raises_value_error(self):
+        manifest = self.manifest([])
+        for bad in (1, "yes", None, []):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DocumentRoom.compare_manifests(manifest, manifest,
+                                               detect_relocations=bad)
+        before_path, after_path = self._manifest_files(manifest, manifest)
+        with self.assertRaises(ValueError):
+            DocumentRoom.compare_manifest_files(before_path, after_path,
+                                                detect_relocations="true")
+
+    def test_detection_does_not_modify_inputs(self):
+        before = self.manifest([self.doc("old.md", ("h", 1), tags=["b", "a"])])
+        after = self.manifest([self.doc("new.md", ("h", 1), tags=["a", "b"])])
+        snapshot = json.dumps([before, after], sort_keys=True)
+        DocumentRoom.compare_manifests(before, after, detect_relocations=True)
+        self.assertEqual(json.dumps([before, after], sort_keys=True), snapshot)
+
+    def test_cli_detect_relocations_flag(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py")]
+        digest = hashlib.sha256(b"Notes\n").hexdigest()
+        before = self.manifest([self.doc("meeting.txt", (digest, 6))])
+        after = self.manifest([self.doc("docs/minutes.txt", (digest, 6))])
+        before_path, after_path = self._manifest_files(before, after)
+        result = subprocess.run(
+            prefix + ["compare", "--before", str(before_path),
+                      "--after", str(after_path), "--detect-relocations"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual([i["after"]["path"] for i in payload["relocated"]],
+                         ["docs/minutes.txt"])
+        self.assertEqual(payload["added"], [])
+        self.assertEqual(payload["removed"], [])
+        self.assertEqual(payload["relocated"][0]["fields"], ["name", "path"])
+        # Without the flag the payload keeps the old six-key structure.
+        result = subprocess.run(
+            prefix + ["compare", "--before", str(before_path),
+                      "--after", str(after_path)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertNotIn("relocated", payload)
+        self.assertEqual([d["path"] for d in payload["added"]],
+                         ["docs/minutes.txt"])
+        self.assertEqual([d["path"] for d in payload["removed"]], ["meeting.txt"])
+        # Bad manifests still fail with an error payload and exit 2, never
+        # printing a partial result.
+        bad = self.manifest([self.doc("d.md")])
+        del bad["complete"]
+        bad_path = Path(self.temp.name) / "bad.json"
+        bad_path.write_text(json.dumps(bad), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["compare", "--before", str(bad_path),
+                      "--after", str(after_path), "--detect-relocations"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+
+
 class RelocateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
