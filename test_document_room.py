@@ -162,6 +162,241 @@ class DocumentRoomTests(unittest.TestCase):
         (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
         return self.room.add("meeting.txt", ["operations"])
 
+    def test_set_archived_roundtrip_restore_and_idempotence(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        archived = self.room.set_archived("policy.md", True)
+        self.assertEqual(archived["path"], "policy.md")
+        self.assertTrue(archived["archived"])
+        # All other metadata and references stay unchanged.
+        self.assertEqual(archived["tags"], ["legal"])
+        self.assertEqual(archived["references"], ["meeting.txt"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertTrue(stored["policy.md"]["archived"])
+        self.assertNotIn("archived", stored["meeting.txt"])
+        # Setting the same state again returns the same content.
+        self.assertEqual(self.room.set_archived("policy.md", True), archived)
+        # Restoring stores false (it is not removed).
+        restored = self.room.set_archived("policy.md", False)
+        self.assertFalse(restored["archived"])
+        self.assertEqual(restored["references"], ["meeting.txt"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertIn("archived", stored["policy.md"])
+        self.assertFalse(stored["policy.md"]["archived"])
+        self.assertEqual(self.room.set_archived("policy.md", False), restored)
+
+    def test_set_archived_matches_index_key_and_ignores_live_file(self):
+        self.room.add("policy.md")
+        # The original file can be gone; archiving only touches the index.
+        (self.root / "policy.md").unlink()
+        record = self.room.set_archived("policy.md", True)
+        self.assertTrue(record["archived"])
+        # Keys match exactly and case-sensitively.
+        with self.assertRaises(ValueError):
+            self.room.set_archived("POLICY.MD", True)
+        with self.assertRaises(ValueError):
+            self.room.set_archived("ghost.md", False)
+
+    def test_set_archived_validation_leaves_index_untouched(self):
+        self.room.add("policy.md")
+        before = self.index.read_text(encoding="utf-8")
+        for args in ((None, True), (7, True), (["policy.md"], True),
+                     ("policy.md", "yes"), ("policy.md", 1),
+                     ("policy.md", None), ("missing.md", True)):
+            with self.assertRaises(ValueError, msg=repr(args)):
+                self.room.set_archived(*args)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_set_archived_without_index_raises_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.set_archived("policy.md", True)
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_set_archived_validates_whole_index(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_archived("policy.md", True)
+        # A non-boolean archived field on an unrelated record is rejected.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["archived"] = "yes"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_archived("policy.md", True)
+        # A dangling reference is rejected too.
+        stored = json.loads(valid)
+        stored["meeting.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.set_archived("policy.md", True)
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.set_archived("policy.md", True)
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_add_preserves_archived_but_initial_add_has_no_field(self):
+        first = self.room.add("policy.md", ["legal"])
+        self.assertNotIn("archived", first)
+        self.room.set_archived("policy.md", True)
+        (self.root / "policy.md").write_text("Revised policy\n", encoding="utf-8")
+        again = self.room.add("policy.md", ["updated"])
+        self.assertTrue(again["archived"])
+        self.room.set_archived("policy.md", False)
+        restored = self.room.add("policy.md", ["updated"])
+        self.assertIn("archived", restored)
+        self.assertFalse(restored["archived"])
+        # A brand-new registration never gains the field.
+        (self.root / "meeting.txt").write_text("Notes\n", encoding="utf-8")
+        self.assertNotIn("archived", self.room.add("meeting.txt"))
+
+    def test_search_archive_state_filters(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_archived("meeting.txt", True)
+        self.assertEqual([r["path"] for r in self.room.search()],
+                         ["meeting.txt", "policy.md"])
+        self.assertEqual([r["path"] for r in self.room.search(archive_state="all")],
+                         ["meeting.txt", "policy.md"])
+        self.assertEqual([r["path"] for r in self.room.search(archive_state="active")],
+                         ["policy.md"])
+        self.assertEqual([r["path"] for r in self.room.search(archive_state="archived")],
+                         ["meeting.txt"])
+        # The filter is conjunctive with tags and path text.
+        self.assertEqual(self.room.search(["operations"], archive_state="active"), [])
+        self.assertEqual(
+            [r["path"] for r in self.room.search(text="MEETING", archive_state="archived")],
+            ["meeting.txt"])
+        # Full stored records are returned, sorted by path, with no default fields added.
+        active = self.room.search(archive_state="active")[0]
+        self.assertNotIn("archived", active)
+        self.assertEqual(active["tags"], ["legal"])
+
+    def test_search_archive_state_validation(self):
+        self.room.add("policy.md")
+        for bad in (None, 7, "yes", "", "ACTIVE", b"all", ["all"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.search(archive_state=bad)
+        # No index: empty results and no file created.
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.search(archive_state="active"), [])
+        self.assertEqual(fresh.search(archive_state="archived"), [])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_search_archive_state_validates_whole_index_even_unmatched(self):
+        self.room.add("policy.md")
+        self._add_meeting()
+        valid = self.index.read_text(encoding="utf-8")
+        stored = json.loads(valid)
+        stored["meeting.txt"]["archived"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.search(text="zzz-nomatch", archive_state="active")
+        stored = json.loads(valid)
+        stored["meeting.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.search(archive_state="archived")
+        # The default "all" scope keeps the original, non-validating behavior.
+        self.assertEqual(len(self.room.search()), 2)
+
+    def test_export_archive_state_filters(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_archived("meeting.txt", True)
+        by_state = {state: [d["path"] for d in
+                            self.room.export_manifest("R", archive_state=state)["documents"]]
+                    for state in ("all", "active", "archived")}
+        self.assertEqual(by_state, {"all": ["meeting.txt", "policy.md"],
+                                    "active": ["policy.md"],
+                                    "archived": ["meeting.txt"]})
+        for state in ("all", "active", "archived"):
+            manifest = self.room.export_manifest("R", archive_state=state)
+            for document in manifest["documents"]:
+                self.assertEqual(set(document),
+                                 {"path", "name", "bytes", "sha256", "tags", "status"})
+
+    def test_export_active_with_references_includes_archived_dependencies(self):
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        self.room.set_archived("meeting.txt", True)
+        # The archive filter only chooses starting documents; dependencies are
+        # pulled in regardless of their archive state, each path once.
+        manifest = self.room.export_manifest("R", archive_state="active",
+                                             include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["meeting.txt", "policy.md"])
+        self.assertTrue(manifest["complete"])
+        # Without expansion the archived document stays out.
+        plain = self.room.export_manifest("R", archive_state="active")
+        self.assertEqual([d["path"] for d in plain["documents"]], ["policy.md"])
+        # An archived starting document with an active dependency includes both too.
+        self.room.set_archived("policy.md", True)
+        self.room.set_archived("meeting.txt", False)
+        manifest = self.room.export_manifest("R", archive_state="archived",
+                                             include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["meeting.txt", "policy.md"])
+
+    def test_export_archive_state_empty_and_validation(self):
+        self.room.add("policy.md")
+        empty = self.room.export_manifest("R", archive_state="active", text="zzz")
+        self.assertEqual(empty["documents"], [])
+        self.assertFalse(empty["complete"])
+        for bad in (None, 7, "nope", b"all"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.export_manifest("R", archive_state=bad)
+        fresh = DocumentRoom(self.root / "nested", self.root / "fresh.json")
+        empty = fresh.export_manifest("R", archive_state="active")
+        self.assertFalse(empty["complete"])
+        self.assertEqual(empty["documents"], [])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_cli_archive_and_archive_state_filters(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        self.room.add("policy.md", ["legal"])
+        self._add_meeting()
+        self.room.set_references("policy.md", ["meeting.txt"])
+        result = subprocess.run(prefix + ["archive", "meeting.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["archived"])
+        result = subprocess.run(prefix + ["search", "--archive-state", "active"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r["path"] for r in json.loads(result.stdout)], ["policy.md"])
+        result = subprocess.run(prefix + ["search", "--archive-state", "archived"],
+                                capture_output=True, text=True)
+        self.assertEqual([r["path"] for r in json.loads(result.stdout)], ["meeting.txt"])
+        # Active reference expansion still includes the archived dependency.
+        result = subprocess.run(prefix + ["export", "--release", "R",
+                                          "--archive-state", "active",
+                                          "--with-references"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([d["path"] for d in json.loads(result.stdout)["documents"]],
+                         ["meeting.txt", "policy.md"])
+        # Restore.
+        result = subprocess.run(prefix + ["archive", "meeting.txt", "--restore"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["archived"])
+        # Errors are JSON payloads with exit code 2.
+        for bad in (["archive", "ghost.md"],
+                    ["search", "--archive-state", "nope"],
+                    ["export", "--release", "R", "--archive-state", "bad"]):
+            result = subprocess.run(prefix + bad, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, bad)
+            self.assertIn("error", json.loads(result.stdout))
+
     def test_set_references_roundtrip_dedup_sort_and_clear(self):
         self.room.add("policy.md", ["legal"])
         self._add_meeting()
