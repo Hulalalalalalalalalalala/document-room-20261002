@@ -113,6 +113,33 @@ class DocumentRoom:
         return [record for _, record in sorted(self._load().items())
                 if wanted.issubset(record["tags"]) and text.casefold() in record["path"].casefold()]
 
+    def find_duplicates(self, tags=(), text=""):
+        if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must be a list or tuple of strings")
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        records = self._load_validated_with_references()
+        # Duplicate groups come from the whole index first; a filter hit on any
+        # member then decides whether the whole group is returned.
+        member_sets = {}
+        for key, record in records.items():
+            member_sets.setdefault((record["bytes"], record["sha256"]), set()).add(key)
+        wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+        result = []
+        for (byte_count, digest), members in member_sets.items():
+            if len(members) < 2:  # at least two distinct paths make a group
+                continue
+            documents = [records[path] for path in sorted(members)]
+            matched = [path for path in sorted(members)
+                       if wanted.issubset(records[path]["tags"])
+                       and text.casefold() in path.casefold()]
+            if not matched:
+                continue
+            result.append({"bytes": byte_count, "sha256": digest,
+                           "matched": matched, "documents": documents})
+        result.sort(key=lambda group: group["documents"][0]["path"])
+        return {"groups": result}
+
     def _file_status(self, record):
         try:
             path = (self.root / record["path"]).resolve()
@@ -256,6 +283,9 @@ def main():
     search = commands.add_parser("search")
     search.add_argument("--tag", action="append", default=[])
     search.add_argument("--text", default="")
+    duplicates = commands.add_parser("duplicates")
+    duplicates.add_argument("--tag", action="append", default=[])
+    duplicates.add_argument("--text", default="")
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
@@ -277,6 +307,8 @@ def main():
             result = room.add(args.path, args.tag)
         elif args.command == "search":
             result = room.search(args.tag, args.text)
+        elif args.command == "duplicates":
+            result = room.find_duplicates(args.tag, args.text)
         elif args.command == "refs":
             result = room.set_references(args.path, args.to)
         elif args.command == "impact":

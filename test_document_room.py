@@ -433,6 +433,179 @@ class DocumentRoomTests(unittest.TestCase):
             self.assertIn("error", json.loads(result.stdout))
 
 
+class DuplicateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "policy.md").write_text("Retention policy\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def _write(self, name, content, tags=()):
+        path = Path(name)
+        (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / path).write_text(content, encoding="utf-8")
+        return self.room.add(name, tags)
+
+    def test_group_payload_filter_hit_returns_whole_group(self):
+        # Same small file registered twice with different names; only a.txt is tagged.
+        self._write("a.txt", "same body", ["release"])
+        self._write("b.txt", "same body")
+        # Same byte count but different content must not join the group.
+        self._write("c.txt", "xxxxxxxxx")
+        result = self.room.find_duplicates()
+        self.assertEqual(set(result), {"groups"})
+        (group,) = result["groups"]
+        self.assertEqual(group["matched"], ["a.txt", "b.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+        self.assertEqual(group["bytes"], len(b"same body"))
+        self.assertEqual(group["sha256"], group["documents"][0]["sha256"])
+        # Filtering by the release tag still returns both records; matched lists only a.txt.
+        tagged = self.room.find_duplicates(tags=["release"])
+        (tagged_group,) = tagged["groups"]
+        self.assertEqual(tagged_group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in tagged_group["documents"]],
+                         ["a.txt", "b.txt"])
+        # A filter that hits no member of the group yields no groups.
+        self.assertEqual(self.room.find_duplicates(tags=["ops"]), {"groups": []})
+        self.assertEqual(self.room.find_duplicates(text="c.txt"), {"groups": []})
+
+    def test_filter_semantics_match_search(self):
+        self._write("Dir/A.txt", "dup", [" Legal ", "POLICY"])
+        self._write("dir/b.txt", "dup", ["legal", "policy"])
+        # Tags are trimmed/lowercased and combined with AND...
+        self.assertEqual(len(self.room.find_duplicates(["LEGAL", " policy "])["groups"]), 1)
+        # Blank tags are ignored, and text matches the path case-insensitively.
+        self.assertEqual(len(self.room.find_duplicates(["  "], "DIR")["groups"]), 1)
+        self.assertEqual(self.room.find_duplicates(["legal"], "zzz"), {"groups": []})
+
+    def test_groups_and_members_sorted(self):
+        self._write("z/x.txt", "one")
+        self._write("a1/x.txt", "one")
+        self._write("b.txt", "two")
+        self._write("a.txt", "two")
+        groups = self.room.find_duplicates()["groups"]
+        self.assertEqual([g["matched"][0] for g in groups], ["a.txt", "a1/x.txt"])
+        self.assertEqual(groups[0]["matched"], ["a.txt", "b.txt"])
+        self.assertEqual([d["path"] for d in groups[1]["documents"]],
+                         ["a1/x.txt", "z/x.txt"])
+
+    def test_documents_are_full_stored_records(self):
+        self._write("a.txt", "same", ["legal"])
+        self._write("b.txt", "same", ["ops"])
+        self.room.set_references("a.txt", ["b.txt"])
+        group = self.room.find_duplicates()["groups"][0]
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(group["documents"], [stored["a.txt"], stored["b.txt"]])
+        self.assertEqual(group["documents"][0]["references"], ["b.txt"])
+        # Old records without references stay as stored: no references or status added.
+        self.assertEqual(set(group["documents"][1]),
+                         {"path", "name", "bytes", "sha256", "tags"})
+
+    def test_no_duplicates_and_missing_index(self):
+        self._write("a.txt", "one")
+        self._write("b.txt", "two")
+        self.assertEqual(self.room.find_duplicates(), {"groups": []})
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.find_duplicates(["legal"], "x"), {"groups": []})
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_query_reads_index_only_and_does_not_update_it(self):
+        self._write("a.txt", "same", ["release"])
+        self._write("b.txt", "same")
+        before = self.index.read_text(encoding="utf-8")
+        (self.root / "a.txt").write_text("changed", encoding="utf-8")
+        (self.root / "b.txt").unlink()
+        result = self.room.find_duplicates(["release"])
+        self.assertEqual([d["path"] for d in result["groups"][0]["documents"]],
+                         ["a.txt", "b.txt"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # A link escaping the root does not change the index-only result either.
+        outside = self.root.parent / "outside-secret.txt"
+        outside.write_text("outside root", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        link = self.root / "a.txt"
+        link.unlink()
+        link.symlink_to(outside)
+        self.assertEqual(self.room.find_duplicates(["release"]), result)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_argument_validation(self):
+        for bad_tags in (None, 7, "legal", {"legal"}, ["legal", 3], (None,)):
+            with self.assertRaises(ValueError, msg=repr(bad_tags)):
+                self.room.find_duplicates(bad_tags)
+        for bad_text in (None, 7, ["x"]):
+            with self.assertRaises(ValueError, msg=repr(bad_text)):
+                self.room.find_duplicates(text=bad_text)
+
+    def test_corrupt_index_raises_even_when_record_not_matched(self):
+        self._write("a.txt", "same", ["release"])
+        self._write("b.txt", "same")
+        self.room.set_references("a.txt", ["b.txt"])
+        valid = self.index.read_text(encoding="utf-8")
+        # Bad JSON and bad UTF-8 are ValueError even when the filter matches nothing.
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates(["no-such-tag"])
+        self.index.write_bytes(b"\xff\xfe{}\n")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates()
+        # A malformed record field invalidates the whole query.
+        stored = json.loads(valid)
+        stored["b.txt"]["bytes"] = "nope"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates(["release"])
+        # A references field that is not a list of strings...
+        stored = json.loads(valid)
+        stored["a.txt"]["references"] = "b.txt"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates()
+        # ...or one that points at an unregistered path is ValueError as well.
+        stored = json.loads(valid)
+        stored["a.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_duplicates(text="a.txt")
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.find_duplicates()
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_cli_duplicates_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
+        self._write("a.txt", "same body", ["release"])
+        self._write("b.txt", "same body")
+        result = subprocess.run(prefix + ["duplicates", "--tag", "RELEASE", "--text", "A.TXT"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (group,) = json.loads(result.stdout)["groups"]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+        # Repeatable tags are AND-combined; unmatched filters print an empty groups array.
+        result = subprocess.run(prefix + ["duplicates", "--tag", "release", "--tag", "ops"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"groups": []})
+        # Missing index still succeeds with an empty payload and creates nothing.
+        missing = [sys.executable, str(ROOT / "document_room.py"),
+                   "--root", str(self.root), "--index", str(self.root / "fresh.json")]
+        result = subprocess.run(missing + ["duplicates"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"groups": []})
+        self.assertFalse((self.root / "fresh.json").exists())
+        # Corrupt index: JSON error payload with exit 2.
+        self.index.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["duplicates"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+
 class ManifestComparisonTests(unittest.TestCase):
     def doc(self, path, **overrides):
         document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
