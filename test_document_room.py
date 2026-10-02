@@ -433,5 +433,218 @@ class DocumentRoomTests(unittest.TestCase):
             self.assertIn("error", json.loads(result.stdout))
 
 
+class ManifestComparisonTests(unittest.TestCase):
+    def doc(self, path, **overrides):
+        document = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                    "sha256": "hash-" + path, "tags": ["a"], "status": "ready"}
+        document.update(overrides)
+        return document
+
+    def manifest(self, documents, release="R1", complete=True):
+        return {"release": release, "complete": complete, "documents": documents}
+
+    def test_categories_and_sorting(self):
+        before = self.manifest([
+            self.doc("b/c.md"), self.doc("removed.md", status="missing"),
+            self.doc("same.md"), self.doc("z.md", name="old")])
+        after = self.manifest([
+            self.doc("a/new.md"), self.doc("b/c.md", bytes=99),
+            self.doc("same.md"), self.doc("z.md", name="new")],
+            release="R2", complete=False)
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["before"], {"release": "R1", "complete": True})
+        self.assertEqual(result["after"], {"release": "R2", "complete": False})
+        self.assertEqual([d["path"] for d in result["added"]], ["a/new.md"])
+        self.assertEqual([d["path"] for d in result["removed"]], ["removed.md"])
+        self.assertEqual([c["path"] for c in result["changed"]], ["b/c.md", "z.md"])
+        self.assertEqual(result["unchanged"], ["same.md"])
+        # Added/removed carry the complete document from the right side.
+        self.assertEqual(result["added"][0], self.doc("a/new.md"))
+        self.assertEqual(result["removed"][0]["status"], "missing")
+
+    def test_changed_keeps_both_documents_and_sorted_fields(self):
+        before = self.manifest([self.doc("d.md", bytes=1, name="n",
+                                         sha256="s", tags=["x"], status="ready")])
+        after = self.manifest([self.doc("d.md", bytes=2, name="m",
+                                        sha256="t", tags=["y"], status="changed")])
+        (item,) = DocumentRoom.compare_manifests(before, after)["changed"]
+        self.assertEqual(item["path"], "d.md")
+        self.assertEqual(item["before"], before["documents"][0])
+        self.assertEqual(item["after"], after["documents"][0])
+        self.assertEqual(item["fields"], ["bytes", "name", "sha256", "status", "tags"])
+
+    def test_status_only_change_is_changed(self):
+        before = self.manifest([self.doc("d.md", status="ready")])
+        after = self.manifest([self.doc("d.md", status="unreadable")], complete=False)
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual([c["fields"] for c in result["changed"]], [["status"]])
+        self.assertEqual(result["unchanged"], [])
+
+    def test_tags_compared_as_sets_but_case_and_whitespace_significant(self):
+        cases = ((["a", "b", "a"], ["b", "a"], []),
+                 (["a"], ["A"], ["tags"]),
+                 (["a"], [" a "], ["tags"]),
+                 (["a", "b"], ["a"], ["tags"]))
+        for old_tags, new_tags, fields in cases:
+            result = DocumentRoom.compare_manifests(
+                self.manifest([self.doc("d.md", tags=old_tags)]),
+                self.manifest([self.doc("d.md", tags=new_tags)]))
+            self.assertEqual(
+                [c["fields"] for c in result["changed"]] + result["unchanged"],
+                [fields] if fields else ["d.md"], msg=f"{old_tags} vs {new_tags}")
+
+    def test_path_pairing_is_case_sensitive_and_exact(self):
+        before = self.manifest([self.doc("Doc.md"), self.doc("a/../x.md")])
+        after = self.manifest([self.doc("doc.md"), self.doc("a/../x.md"),
+                               self.doc("a/x.md")])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual([d["path"] for d in result["added"]], ["a/x.md", "doc.md"])
+        self.assertEqual([d["path"] for d in result["removed"]], ["Doc.md"])
+        self.assertEqual(result["unchanged"], ["a/../x.md"])
+
+    def test_release_and_complete_do_not_affect_classification(self):
+        before = self.manifest([self.doc("d.md")], release="R1", complete=False)
+        after = self.manifest([self.doc("d.md")], release="Different", complete=True)
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["unchanged"], ["d.md"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["before"], {"release": "R1", "complete": False})
+        self.assertEqual(result["after"], {"release": "Different", "complete": True})
+
+    def test_extra_fields_preserved_but_not_compared(self):
+        before = self.manifest([self.doc("d.md", references=["x"], note="old")])
+        after = self.manifest([self.doc("d.md", references=["y"], note="new")])
+        result = DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(result["unchanged"], ["d.md"])
+        # Extra top-level fields are tolerated too.
+        before["generated_by"] = "export"
+        self.assertEqual(DocumentRoom.compare_manifests(before, after)["unchanged"], ["d.md"])
+
+    def test_both_empty(self):
+        result = DocumentRoom.compare_manifests(self.manifest([]), self.manifest([]))
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["unchanged"], [])
+        self.assertEqual(result["before"], {"release": "R1", "complete": True})
+
+    def test_inputs_are_not_modified(self):
+        before = self.manifest([self.doc("d.md", tags=["b", "a", "a"])])
+        after = self.manifest([self.doc("d.md", tags=["a", "b"])])
+        snapshot = json.dumps([before, after], sort_keys=True)
+        DocumentRoom.compare_manifests(before, after)
+        self.assertEqual(json.dumps([before, after], sort_keys=True), snapshot)
+
+    def test_invalid_manifests_raise_value_error(self):
+        valid = self.manifest([self.doc("d.md")])
+
+        def expect_value_error(before, after):
+            with self.assertRaises(ValueError):
+                DocumentRoom.compare_manifests(before, after)
+
+        expect_value_error([], valid)
+        expect_value_error({}, valid)
+        bad = json.loads(json.dumps(valid))
+        bad["release"] = "   "
+        expect_value_error(bad, valid)
+        bad = json.loads(json.dumps(valid))
+        bad["release"] = 5
+        expect_value_error(bad, valid)
+        bad = json.loads(json.dumps(valid))
+        bad["complete"] = "yes"
+        expect_value_error(bad, valid)
+        bad = json.loads(json.dumps(valid))
+        bad["documents"] = {}
+        expect_value_error(bad, valid)
+        for field, bad_value in (("path", 1), ("name", 1), ("sha256", 1),
+                                 ("bytes", 1.5), ("bytes", True),
+                                 ("tags", "a"), ("tags", ["a", 1]),
+                                 ("status", "draft")):
+            bad = json.loads(json.dumps(valid))
+            bad["documents"][0][field] = bad_value
+            expect_value_error(bad, valid)
+            expect_value_error(valid, bad)
+        for missing in ("release", "complete", "documents"):
+            bad = json.loads(json.dumps(valid))
+            del bad[missing]
+            expect_value_error(bad, valid)
+        for missing in ("path", "name", "sha256", "bytes", "tags", "status"):
+            bad = json.loads(json.dumps(valid))
+            del bad["documents"][0][missing]
+            expect_value_error(bad, valid)
+        bad = json.loads(json.dumps(valid))
+        bad["documents"].append(self.doc("d.md"))
+        expect_value_error(bad, valid)
+        bad = json.loads(json.dumps(valid))
+        bad["documents"] = ["not-an-object"]
+        expect_value_error(bad, valid)
+
+    def test_file_based_compare_matches_dict_api(self):
+        before = self.manifest([self.doc("old.md"), self.doc("same.md"),
+                                self.doc("t.md", tags=["a", "b"])])
+        after = self.manifest([self.doc("new.md"), self.doc("same.md"),
+                               self.doc("t.md", tags=["b", "a", "b"])],
+                              release="R2", complete=False)
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            before_path = Path(temp) / "before.json"
+            after_path = Path(temp) / "after.json"
+            before_path.write_text(json.dumps(before), encoding="utf-8")
+            after_path.write_text(json.dumps(after), encoding="utf-8")
+            from_files = DocumentRoom.compare_manifest_files(before_path, after_path)
+        self.assertEqual(from_files, DocumentRoom.compare_manifests(before, after))
+        self.assertEqual([d["path"] for d in from_files["removed"]], ["old.md"])
+        self.assertEqual([d["path"] for d in from_files["added"]], ["new.md"])
+        self.assertEqual(from_files["unchanged"], ["same.md", "t.md"])
+
+    def test_cli_compare_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py")]
+        before = self.manifest([self.doc("old.md"), self.doc("d.md", status="ready")])
+        after = self.manifest([self.doc("new.md"), self.doc("d.md", status="missing")],
+                              complete=False)
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            before_path = Path(temp) / "before.json"
+            after_path = Path(temp) / "after.json"
+            before_path.write_text(json.dumps(before), encoding="utf-8")
+            after_path.write_text(json.dumps(after), encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(before_path),
+                          "--after", str(after_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual([d["path"] for d in payload["added"]], ["new.md"])
+            self.assertEqual([d["path"] for d in payload["removed"]], ["old.md"])
+            self.assertEqual(payload["changed"][0]["fields"], ["status"])
+            # Malformed JSON: error payload with exit 2.
+            bad_json = Path(temp) / "bad.json"
+            bad_json.write_text("{not json", encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(bad_json),
+                          "--after", str(after_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            # Invalid UTF-8: error payload with exit 2.
+            bad_utf8 = Path(temp) / "utf8.json"
+            bad_utf8.write_bytes(b'\xff\xfe{"release": "R"}')
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(bad_utf8),
+                          "--after", str(after_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            # Missing file: OSError surfaces as error payload with exit 2.
+            result = subprocess.run(
+                prefix + ["compare", "--before", str(Path(temp) / "missing.json"),
+                          "--after", str(after_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            # Input files are untouched and no files are created.
+            self.assertEqual(json.loads(before_path.read_text(encoding="utf-8")), before)
+            self.assertEqual(set(os.listdir(temp)),
+                             {"before.json", "after.json", "bad.json", "utf8.json"})
+
+
 if __name__ == "__main__":
     unittest.main()

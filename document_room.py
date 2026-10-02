@@ -6,6 +6,9 @@ from pathlib import Path
 
 
 class DocumentRoom:
+    STATUSES = {"ready", "changed", "missing", "unsafe", "unreadable"}
+    COMPARED_FIELDS = ("bytes", "name", "sha256", "status", "tags")
+
     def __init__(self, root, index):
         self.root = Path(root).resolve()
         self.index = Path(index)
@@ -155,6 +158,92 @@ class DocumentRoom:
                 "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
                 "documents": documents}
 
+    @staticmethod
+    def _validated_manifest(manifest):
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must be a JSON object")
+        release = manifest.get("release")
+        if not isinstance(release, str) or not release.strip():
+            raise ValueError("manifest release must be a non-blank string")
+        if not isinstance(manifest.get("complete"), bool):
+            raise ValueError("manifest complete must be a boolean")
+        documents = manifest.get("documents")
+        if not isinstance(documents, list):
+            raise ValueError("manifest documents must be an array")
+        seen = set()
+        for document in documents:
+            if not isinstance(document, dict):
+                raise ValueError("manifest document must be an object")
+            path = document.get("path")
+            if not isinstance(path, str):
+                raise ValueError("manifest document path must be a string")
+            if path in seen:
+                raise ValueError("manifest contains a duplicate path")
+            seen.add(path)
+            if not isinstance(document.get("name"), str):
+                raise ValueError("manifest document name must be a string")
+            if not isinstance(document.get("sha256"), str):
+                raise ValueError("manifest document sha256 must be a string")
+            if (not isinstance(document.get("bytes"), int)
+                    or isinstance(document.get("bytes"), bool)):
+                raise ValueError("manifest document bytes must be a non-boolean integer")
+            tags = document.get("tags")
+            if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+                raise ValueError("manifest document tags must be an array of strings")
+            if document.get("status") not in DocumentRoom.STATUSES:
+                raise ValueError("manifest document status must be one of "
+                                 + ", ".join(sorted(DocumentRoom.STATUSES)))
+        return manifest
+
+    @staticmethod
+    def compare_manifests(before, after):
+        before = DocumentRoom._validated_manifest(before)
+        after = DocumentRoom._validated_manifest(after)
+        before_docs = {d["path"]: d for d in before["documents"]}
+        after_docs = {d["path"]: d for d in after["documents"]}
+        before_paths = set(before_docs)
+        after_paths = set(after_docs)
+        changed = []
+        unchanged = []
+        for path in sorted(before_paths & after_paths):
+            old = before_docs[path]
+            new = after_docs[path]
+            fields = []
+            for field in DocumentRoom.COMPARED_FIELDS:
+                if field == "tags":
+                    differs = set(old["tags"]) != set(new["tags"])
+                else:
+                    differs = old[field] != new[field]
+                if differs:
+                    fields.append(field)
+            if fields:
+                changed.append({"path": path, "before": old, "after": new,
+                                "fields": fields})
+            else:
+                unchanged.append(path)
+        return {
+            "before": {"release": before["release"], "complete": before["complete"]},
+            "after": {"release": after["release"], "complete": after["complete"]},
+            "added": [after_docs[path] for path in sorted(after_paths - before_paths)],
+            "removed": [before_docs[path] for path in sorted(before_paths - after_paths)],
+            "changed": changed,
+            "unchanged": unchanged,
+        }
+
+    @staticmethod
+    def compare_manifest_files(before_path, after_path):
+        def load(path):
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        try:
+            before = load(before_path)
+            after = load(after_path)
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"manifest file is not valid UTF-8: {exc}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"manifest file is not valid JSON: {exc}")
+        return DocumentRoom.compare_manifests(before, after)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -178,6 +267,9 @@ def main():
     export.add_argument("--tag", action="append", default=[])
     export.add_argument("--text", default="")
     export.add_argument("--with-references", action="store_true")
+    compare = commands.add_parser("compare")
+    compare.add_argument("--before", required=True)
+    compare.add_argument("--after", required=True)
     args = parser.parse_args()
     try:
         room = DocumentRoom(args.root, args.index)
@@ -189,6 +281,8 @@ def main():
             result = room.set_references(args.path, args.to)
         elif args.command == "impact":
             result = room.reference_impact(args.path, transitive=args.transitive)
+        elif args.command == "compare":
+            result = room.compare_manifest_files(args.before, args.after)
         else:
             result = room.export_manifest(args.release, args.tag, args.text,
                                           include_references=args.with_references)
