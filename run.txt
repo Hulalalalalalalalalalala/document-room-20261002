@@ -21,6 +21,8 @@ python3 document_room.py tags policy.md meeting.txt --add legal --add release --
 Batch-edits stored tags by exact index key (index only; files are never read): repeatable --add/--remove are trimmed and lowercased like add tags, the result is sorted and de-duplicated, overlap after normalization or any unregistered path fails the whole batch, printing updated full records and unchanged paths; at least one path is required.
 python3 document_room.py relocate meeting.txt docs/meeting.txt
 Moves a registration from the old exact index key to the new file's canonical root-relative path after you move the file yourself (index only; the file must exist inside the root with the same bytes and SHA-256); all references, including self-references, are rewritten to the new key, printing before, after and updated.
+python3 document_room.py relocate-batch --from moves.json
+Moves several registrations at once from a UTF-8 JSON array of {"source", "destination"} objects (exactly those two string fields each); destination keys duplicate, self or occupied by a non-moving record fail the batch, while keys held by another batch source allow swaps and cycles; all references are remapped once preserving order, duplicates, self-references and cycles, printing moved (full before/after pairs) and updated (non-moved records with changed references).
 python3 document_room.py export --release "Q4 Launch"
 Checks the registered files and reports ready, changed, missing, unsafe or unreadable; complete is true only when every listed document is ready.
 python3 document_room.py export --release "Q4 Launch" --with-references --with-blockers

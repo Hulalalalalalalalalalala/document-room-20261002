@@ -283,6 +283,105 @@ class DocumentRoom:
                 "after": after,
                 "updated": sorted(updated, key=lambda record: record["path"])}
 
+    def relocate_records(self, items):
+        # Each plan item is an object holding exactly the two string fields
+        # "source" and "destination"; anything else fails the whole batch.
+        if not isinstance(items, list):
+            raise ValueError("relocation batch must be a list")
+        parsed = []
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {"source", "destination"}:
+                raise ValueError(
+                    "each relocation must be an object with exactly source and destination")
+            source = item["source"]
+            destination = item["destination"]
+            if not isinstance(source, str) or not isinstance(destination, str):
+                raise ValueError("source and destination paths must be strings")
+            parsed.append((source, destination))
+        # The whole index must be structurally sound before anything changes.
+        records = self._load_validated_with_version_notes()
+        sources = []
+        for source, _ in parsed:
+            if source not in records:
+                raise ValueError("source document is not registered: " + source)
+            sources.append(source)
+        if len(set(sources)) != len(sources):
+            raise ValueError("relocation batch contains duplicate sources")
+        moving = set(sources)
+        # Every destination is resolved against the live filesystem exactly
+        # like add; source keys are never resolved or read. All destinations
+        # are checked (and later read) in plan order before anything changes,
+        # so the outcome never depends on that order.
+        pairs = []
+        seen_destinations = set()
+        for source, destination in parsed:
+            try:
+                path = (self.root / destination).resolve()
+            except (OSError, RuntimeError, ValueError):
+                raise ValueError("destination must be a file inside the document root")
+            if not path.is_relative_to(self.root):  # escaping targets are never read
+                raise ValueError("destination must be a file inside the document root")
+            if not path.is_file():
+                raise ValueError("destination must be a file inside the document root")
+            key = path.relative_to(self.root).as_posix()
+            if key == source:
+                raise ValueError("destination must differ from the source path")
+            if key in seen_destinations:
+                raise ValueError("relocation batch contains duplicate destinations")
+            seen_destinations.add(key)
+            # A key held by a record that does not move is forbidden; a key
+            # belonging to another source in this batch allows swaps and
+            # multi-document relocation cycles.
+            if key in records and key not in moving:
+                raise ValueError("destination document is already registered")
+            pairs.append((source, key, path))
+        # The file waiting at each target must carry the source record's
+        # registered bytes and digest; content metadata is never refreshed.
+        for source, key, path in pairs:
+            original = records[source]
+            content = path.read_bytes()
+            if (len(content) != original["bytes"]
+                    or hashlib.sha256(content).hexdigest() != original["sha256"]):
+                raise ValueError(
+                    "destination content does not match the registered bytes or sha256")
+        mapping = {source: key for source, key, _ in pairs}
+        after_by_source = {}
+        moved = []
+        for source, key, path in pairs:
+            original = records[source]
+            before = dict(original)
+            after = dict(original)
+            after["path"] = key
+            after["name"] = path.name
+            if "references" in after:  # every old key is remapped in one step
+                after["references"] = [mapping.get(target, target)
+                                       for target in after["references"]]
+            after_by_source[source] = after
+            moved.append({"before": before, "after": after})
+        # Every other record's references follow the moved documents to their
+        # new keys; one simultaneous mapping pass keeps swaps and cycles
+        # correct. Order and duplicates are preserved and records without
+        # references stay untouched.
+        updated = []
+        new_records = {}
+        for old_key, record in records.items():
+            if old_key in moving:
+                continue
+            if "references" in record and any(
+                    target in mapping for target in record["references"]):
+                record["references"] = [mapping.get(target, target)
+                                        for target in record["references"]]
+                updated.append(record)
+            new_records[old_key] = record
+        for source, key, _ in pairs:
+            new_records[key] = after_by_source[source]
+        if pairs:  # an empty batch validates the index but never writes it
+            self.index.write_text(
+                json.dumps(new_records, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+        return {"moved": sorted(moved, key=lambda item: item["before"]["path"]),
+                "updated": sorted(updated, key=lambda record: record["path"])}
+
     @staticmethod
     def _validate_importable(records):
         # Per-record field and type checks shared by the stored index and an
@@ -839,6 +938,8 @@ def main():
     relocate = commands.add_parser("relocate")
     relocate.add_argument("source")
     relocate.add_argument("destination")
+    relocate_batch = commands.add_parser("relocate-batch")
+    relocate_batch.add_argument("--from", dest="from_path", required=True)
     refs = commands.add_parser("refs")
     refs.add_argument("path")
     refs.add_argument("--to", action="append", default=[])
@@ -892,6 +993,15 @@ def main():
                                     remove_tags=args.remove)
         elif args.command == "relocate":
             result = room.relocate_record(args.source, args.destination)
+        elif args.command == "relocate-batch":
+            try:
+                with open(args.from_path, encoding="utf-8") as handle:
+                    batch = json.load(handle)
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"relocation plan file is not valid UTF-8: {exc}")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"relocation plan file is not valid JSON: {exc}")
+            result = room.relocate_records(batch)
         elif args.command == "search":
             result = room.search(args.tag, args.text, args.archive_state, args.category)
         elif args.command == "refs":
