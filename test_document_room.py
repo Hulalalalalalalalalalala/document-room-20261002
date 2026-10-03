@@ -4235,5 +4235,225 @@ class MergeDuplicatesTests(unittest.TestCase):
             self.assertEqual(set(json.loads(result.stdout)), {"error"})
 
 
+class ReferenceCycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def _add_file(self, name, body=None, tags=()):
+        (self.root / name).write_text(body if body is not None else f"body of {name}\n",
+                                      encoding="utf-8")
+        return self.room.add(name, tags)
+
+    def test_mutual_reference_forms_one_group(self):
+        first = self._add_file("a.txt")
+        second = self._add_file("b.txt")
+        self._add_file("c.txt")  # no references: no group
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt"])
+        result = self.room.find_reference_cycles()
+        self.assertEqual(set(result), {"groups"})
+        (group,) = result["groups"]
+        self.assertEqual(set(group), {"matched", "documents"})
+        self.assertEqual(group["matched"], ["a.txt", "b.txt"])
+        self.assertEqual(group["documents"], [
+            {**first, "references": ["b.txt"]},
+            {**second, "references": ["a.txt"]}])
+
+    def test_single_member_group_requires_direct_self_reference(self):
+        self._add_file("self.txt")
+        self._add_file("plain.txt")
+        self.room.set_references("self.txt", ["self.txt"])
+        self.room.set_references("plain.txt", ["self.txt"])  # one-way into the loop
+        result = self.room.find_reference_cycles()
+        (group,) = result["groups"]
+        self.assertEqual(group["matched"], ["self.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["self.txt"])
+        # A record with no self-reference and no cycle yields nothing.
+        result = self.room.find_reference_cycles(text="plain")
+        self.assertEqual(result, {"groups": []})
+
+    def test_shared_member_cycles_merge_one_way_cycles_do_not(self):
+        # a↔b and b↔c share b: one group of three.
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self._add_file(name)
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt", "c.txt"])
+        self.room.set_references("c.txt", ["b.txt"])
+        (group,) = self.room.find_reference_cycles()["groups"]
+        self.assertEqual(group["matched"], ["a.txt", "b.txt", "c.txt"])
+        # Two independent cycles connected one way stay two groups.
+        for name in ("d.txt", "e.txt"):
+            self._add_file(name)
+        self.room.set_references("c.txt", ["b.txt", "d.txt"])
+        self.room.set_references("d.txt", ["e.txt"])
+        self.room.set_references("e.txt", ["d.txt"])
+        groups = self.room.find_reference_cycles()["groups"]
+        self.assertEqual([[d["path"] for d in g["documents"]] for g in groups],
+                         [["a.txt", "b.txt", "c.txt"], ["d.txt", "e.txt"]])
+
+    def test_documents_pointing_at_or_pointed_by_a_cycle_stay_out(self):
+        for name in ("in.txt", "x.txt", "y.txt", "out.txt"):
+            self._add_file(name)
+        self.room.set_references("in.txt", ["x.txt"])
+        self.room.set_references("x.txt", ["y.txt"])
+        self.room.set_references("y.txt", ["x.txt", "out.txt"])
+        (group,) = self.room.find_reference_cycles()["groups"]
+        self.assertEqual([d["path"] for d in group["documents"]], ["x.txt", "y.txt"])
+
+    def test_filter_hits_one_member_returns_whole_group(self):
+        self._add_file("a.txt", tags=["release"])
+        self._add_file("b.txt", tags=["draft"])
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt"])
+        group = self.room.find_reference_cycles([" RELEASE "])["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+        self.assertEqual(
+            self.room.find_reference_cycles(text="B.TXT")["groups"][0]["matched"],
+            ["b.txt"])
+        # A tag no member carries, or a conjunction no single member satisfies.
+        self.assertEqual(self.room.find_reference_cycles(["finance"]), {"groups": []})
+        self.assertEqual(self.room.find_reference_cycles(["release", "draft"]),
+                         {"groups": []})
+
+    def test_archive_and_category_filters_follow_search_semantics(self):
+        self._add_file("a.txt")
+        self._add_file("b.txt")
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt"])
+        self.room.set_archived("b.txt", True)
+        self.room.set_category("a.txt", "Legal")
+        # An archived member still returns the group when the filter hits it.
+        group = self.room.find_reference_cycles(archive_state="archived")["groups"][0]
+        self.assertEqual(group["matched"], ["b.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+        group = self.room.find_reference_cycles(archive_state="active",
+                                                category=" Legal ")["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        # The default keeps every member eligible.
+        self.assertEqual(self.room.find_reference_cycles()["groups"][0]["matched"],
+                         ["a.txt", "b.txt"])
+        self.assertEqual(self.room.find_reference_cycles(category="Other"),
+                         {"groups": []})
+
+    def test_groups_sorted_by_smallest_member_and_order_independent(self):
+        for name in ("z1.txt", "z2.txt", "a1.txt", "a2.txt"):
+            self._add_file(name)
+        self.room.set_references("z1.txt", ["z2.txt"])
+        self.room.set_references("z2.txt", ["z1.txt"])
+        self.room.set_references("a1.txt", ["a2.txt"])
+        self.room.set_references("a2.txt", ["a1.txt"])
+        expected = self.room.find_reference_cycles()
+        self.assertEqual([g["matched"][0] for g in expected["groups"]],
+                         ["a1.txt", "z1.txt"])
+        # Rewriting the index with shuffled record and references order changes nothing.
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        shuffled = {key: stored[key] for key in reversed(list(stored))}
+        self.index.write_text(json.dumps(shuffled), encoding="utf-8")
+        self.assertEqual(self.room.find_reference_cycles(), expected)
+
+    def test_reads_index_only_and_never_writes(self):
+        self._add_file("a.txt")
+        self._add_file("b.txt")
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt"])
+        before = self.index.read_text(encoding="utf-8")
+        expected = self.room.find_reference_cycles()
+        # Changed or deleted files do not affect the stored-metadata result.
+        (self.root / "a.txt").write_text("totally changed now", encoding="utf-8")
+        (self.root / "b.txt").unlink()
+        self.assertEqual(self.room.find_reference_cycles(), expected)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_without_index_returns_empty_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.find_reference_cycles(), {"groups": []})
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_argument_validation(self):
+        self._add_file("a.txt")
+        for bad in (None, 7, "legal", {"x"}, [1], [None]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(bad)
+        for bad in (None, 7, ["x"], b"x"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(text=bad)
+        for bad in (None, 7, "everything", ""):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(archive_state=bad)
+        for bad in (7, ["Legal"], b"Legal"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(category=bad)
+
+    def test_corrupt_index_fails_even_unrelated_records(self):
+        self._add_file("a.txt")
+        self._add_file("b.txt")
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt"])
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        # A malformed record outside every group still invalidates the query.
+        stored = json.loads(valid)
+        stored["a.txt"]["sha256"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles(text="zzz")
+        # A dangling reference, a non-list references field, a non-boolean
+        # archived and a non-string category all fail the whole query.
+        for mutate in (
+                lambda s: s["a.txt"].update(references=["ghost.txt"]),
+                lambda s: s["a.txt"].update(references="b.txt"),
+                lambda s: s["a.txt"].update(archived="yes"),
+                lambda s: s["a.txt"].update(category=7)):
+            stored = json.loads(valid)
+            mutate(stored)
+            self.index.write_text(json.dumps(stored), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.room.find_reference_cycles()
+        self.index.write_text(valid, encoding="utf-8")
+        self.assertEqual(len(self.room.find_reference_cycles()["groups"]), 1)
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.find_reference_cycles()
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_cli_reference_cycles_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        self._add_file("a.txt", tags=["release"])
+        self._add_file("b.txt")
+        self.room.set_references("a.txt", ["b.txt"])
+        self.room.set_references("b.txt", ["a.txt"])
+        result = subprocess.run(
+            prefix + ["reference-cycles", "--tag", "RELEASE", "--text", "a.txt"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        group = json.loads(result.stdout)["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+        # No cycle: empty groups payload, still exit 0.
+        self.room.set_references("b.txt", [])
+        result = subprocess.run(prefix + ["reference-cycles"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"groups": []})
+        # An illegal filter value prints only an error object and exits 2.
+        result = subprocess.run(prefix + ["reference-cycles", "--archive-state", "bogus"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+
+
 if __name__ == "__main__":
     unittest.main()

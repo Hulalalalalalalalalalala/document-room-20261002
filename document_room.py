@@ -601,6 +601,83 @@ class DocumentRoom:
         groups.sort(key=lambda group: group["documents"][0]["path"])
         return {"groups": groups}
 
+    @staticmethod
+    def _strongly_connected_components(records):
+        # Iterative Tarjan over the whole index's directed reference graph.
+        # Starting nodes are visited in sorted order so the outcome never
+        # depends on index or references array ordering.
+        index_of = {}
+        lowlink = {}
+        on_stack = set()
+        stack = []
+        components = []
+        for start in sorted(records):
+            if start in index_of:
+                continue
+            index_of[start] = lowlink[start] = len(index_of)
+            stack.append(start)
+            on_stack.add(start)
+            work = [(start, iter(records[start].get("references", [])))]
+            while work:
+                node, edges = work[-1]
+                descended = False
+                for target in edges:
+                    if target not in index_of:
+                        index_of[target] = lowlink[target] = len(index_of)
+                        stack.append(target)
+                        on_stack.add(target)
+                        work.append((target, iter(records[target].get("references", []))))
+                        descended = True
+                        break
+                    if target in on_stack:
+                        lowlink[node] = min(lowlink[node], index_of[target])
+                if descended:
+                    continue
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[node])
+                if lowlink[node] == index_of[node]:  # node roots one component
+                    component = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        component.append(member)
+                        if member == node:
+                            break
+                    components.append(component)
+        return components
+
+    def find_reference_cycles(self, tags=(), text="", archive_state="all", category=None):
+        if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must be a list or tuple of strings")
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        self._check_archive_state(archive_state)
+        self._check_category_filter(category)
+        records = self._load_validated_with_categories()
+        wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+
+        def matches(record):
+            return (wanted.issubset(record["tags"])
+                    and text.casefold() in record["path"].casefold()
+                    and self._matches_archive_state(record, archive_state)
+                    and self._matches_category(record, category))
+
+        groups = []
+        for component in self._strongly_connected_components(records):
+            paths = sorted(component)
+            if (len(paths) == 1
+                    and paths[0] not in records[paths[0]].get("references", [])):
+                continue  # a single member only counts when it references itself
+            matched = [path for path in paths if matches(records[path])]
+            if not matched:  # a filter must hit at least one member to return the group
+                continue
+            groups.append({"matched": matched,
+                           "documents": [records[path] for path in paths]})
+        groups.sort(key=lambda group: group["documents"][0]["path"])
+        return {"groups": groups}
+
     def merge_duplicates(self, keep, sources):
         if not isinstance(keep, str):
             raise ValueError("keep path must be a string")
@@ -1008,6 +1085,11 @@ def main():
     duplicates = commands.add_parser("duplicates")
     duplicates.add_argument("--tag", action="append", default=[])
     duplicates.add_argument("--text", default="")
+    cycles = commands.add_parser("reference-cycles")
+    cycles.add_argument("--tag", action="append", default=[])
+    cycles.add_argument("--text", default="")
+    cycles.add_argument("--archive-state", default="all")
+    cycles.add_argument("--category", default=None)
     merge = commands.add_parser("merge-duplicates")
     merge.add_argument("path")
     merge.add_argument("--from", dest="sources", action="append", default=[])
@@ -1072,6 +1154,9 @@ def main():
                                            include_routes=args.with_routes)
         elif args.command == "duplicates":
             result = room.find_duplicates(args.tag, args.text)
+        elif args.command == "reference-cycles":
+            result = room.find_reference_cycles(args.tag, args.text,
+                                                args.archive_state, args.category)
         elif args.command == "merge-duplicates":
             result = room.merge_duplicates(args.path, args.sources)
         elif args.command == "compare":
