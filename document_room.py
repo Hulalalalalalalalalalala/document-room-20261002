@@ -339,6 +339,47 @@ class DocumentRoom:
                                   encoding="utf-8")
         return {"added": sorted(added), "unchanged": sorted(unchanged)}
 
+    def preview_import(self, batch):
+        if not isinstance(batch, dict):
+            raise ValueError("import batch must be an object of records")
+        existing = self._load()
+        if not isinstance(existing, dict):
+            raise ValueError("index must be a JSON object of records")
+        # The same structural and field-type rules as a real import apply to
+        # the whole index and the whole batch before anything is classified.
+        self._validate_importable(existing)
+        self._validate_importable(batch)
+        added = []
+        unchanged = []
+        conflicts = []
+        for key in sorted(batch):
+            if key not in existing:
+                added.append(key)
+            elif existing[key] == batch[key]:  # field set and values, arrays ordered
+                unchanged.append(key)
+            else:
+                stored = existing[key]
+                record = batch[key]
+                # Top-level fields that are added, missing or differ in value;
+                # nested differences belong to their top-level field.
+                fields = sorted(
+                    field for field in set(stored) | set(record)
+                    if field not in stored or field not in record
+                    or stored[field] != record[field])
+                conflicts.append({"path": key, "existing": stored,
+                                  "incoming": record, "fields": fields})
+        # Every reference on both sides, conflicting records included, must
+        # resolve against the union of existing and batch paths.
+        registered = set(existing) | set(batch)
+        for record in list(existing.values()) + list(batch.values()):
+            for target in record.get("references", []):
+                if target not in registered:
+                    raise ValueError("record references an unregistered path")
+        return {"can_import": not conflicts,
+                "added": added,
+                "unchanged": unchanged,
+                "conflicts": conflicts}
+
     def export_records(self, tags=(), text="", archive_state="all", category=None):
         if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
             raise ValueError("tags must be a list or tuple of strings")
@@ -822,6 +863,7 @@ def main():
     compare.add_argument("--compare-version-notes", action="store_true")
     importer = commands.add_parser("import")
     importer.add_argument("--from", dest="from_path", required=True)
+    importer.add_argument("--preview", action="store_true")
     dump = commands.add_parser("dump")
     dump.add_argument("--tag", action="append", default=[])
     dump.add_argument("--text", default="")
@@ -869,7 +911,10 @@ def main():
                 raise ValueError(f"import file is not valid UTF-8: {exc}")
             except json.JSONDecodeError as exc:
                 raise ValueError(f"import file is not valid JSON: {exc}")
-            result = room.import_records(batch)
+            if args.preview:
+                result = room.preview_import(batch)
+            else:
+                result = room.import_records(batch)
         elif args.command == "dump":
             result = room.export_records(args.tag, args.text, args.archive_state,
                                          args.category)
