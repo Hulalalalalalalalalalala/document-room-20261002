@@ -2169,6 +2169,307 @@ class ImportTests(unittest.TestCase):
         stored = json.loads(self.index.read_text(encoding="utf-8"))
         self.assertNotIn("only.md", stored)
 
+    def test_replace_adopts_incoming_record_verbatim(self):
+        self.room.import_records({"a.md": self.record("a.md", tags=["x", "y"],
+                                                      archived=True,
+                                                      references=["b.md"]),
+                                  "b.md": self.record("b.md", category="Old")})
+        incoming = self.record("a.md", tags=["z"], category="Legal",
+                               references=["b.md", "b.md"], extra={"keep": [1, 2]})
+        result = self.room.import_records({"a.md": incoming},
+                                          replace_paths=["a.md"])
+        self.assertEqual(result, {"added": [], "unchanged": [],
+                                  "replaced": ["a.md"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        # The whole incoming record wins: no field merge, array order kept,
+        # extra fields kept, the missing archived field stays missing.
+        self.assertEqual(stored["a.md"], incoming)
+        self.assertNotIn("archived", stored["a.md"])
+        self.assertEqual(stored["a.md"]["references"], ["b.md", "b.md"])
+        self.assertEqual(stored["b.md"], self.record("b.md", category="Old"))
+
+    def test_replace_accepts_tuple_and_processes_duplicates_once(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1),
+                                  "b.md": self.record("b.md", bytes=1)})
+        result = self.room.import_records(
+            {"a.md": self.record("a.md", bytes=2),
+             "b.md": self.record("b.md", bytes=2)},
+            replace_paths=("b.md", "a.md", "a.md", "b.md"))
+        self.assertEqual(result, {"added": [], "unchanged": [],
+                                  "replaced": ["a.md", "b.md"]})
+
+    def test_replace_identical_pair_stays_unchanged_and_is_not_written(self):
+        self.room.import_records({"a.md": self.record("a.md")})
+        before = self.index.read_text(encoding="utf-8")
+        result = self.room.import_records({"a.md": self.record("a.md")},
+                                          replace_paths=["a.md"])
+        self.assertEqual(result, {"added": [], "unchanged": ["a.md"],
+                                  "replaced": []})
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_replace_no_actual_change_writes_nothing(self):
+        self.room.import_records({"a.md": self.record("a.md"),
+                                  "b.md": self.record("b.md")})
+        before = self.index.read_text(encoding="utf-8")
+        result = self.room.import_records(
+            {"a.md": self.record("a.md"), "b.md": self.record("b.md")},
+            replace_paths=["a.md", "b.md"])
+        self.assertEqual(result, {"added": [],
+                                  "unchanged": ["a.md", "b.md"],
+                                  "replaced": []})
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_replace_remaining_conflict_rejects_whole_batch(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1),
+                                  "b.md": self.record("b.md", bytes=1),
+                                  "c.md": self.record("c.md")})
+        before = self.index.read_text(encoding="utf-8")
+        batch = {"a.md": self.record("a.md", bytes=2),
+                 "b.md": self.record("b.md", bytes=2),
+                 "new.md": self.record("new.md")}
+        with self.assertRaises(ValueError):
+            self.room.import_records(batch, replace_paths=["a.md"])
+        # Nothing is replaced, added or written while another conflict remains.
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_replace_path_must_exist_on_both_sides(self):
+        self.room.import_records({"a.md": self.record("a.md"),
+                                  "b.md": self.record("b.md")})
+        before = self.index.read_text(encoding="utf-8")
+        # Only in the index.
+        with self.assertRaises(ValueError):
+            self.room.import_records({"a.md": self.record("a.md", bytes=2)},
+                                     replace_paths=["b.md"])
+        # Only in the batch.
+        with self.assertRaises(ValueError):
+            self.room.import_records({"new.md": self.record("new.md")},
+                                     replace_paths=["new.md"])
+        # On neither side.
+        with self.assertRaises(ValueError):
+            self.room.import_records({"a.md": self.record("a.md")},
+                                     replace_paths=["ghost.md"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        nested = DocumentRoom(self.root, self.root / "nested" / "index.json")
+        with self.assertRaises(ValueError):
+            nested.import_records({"a.md": self.record("a.md")},
+                                  replace_paths=["a.md"])
+        self.assertFalse((self.root / "nested").exists())
+
+    def test_replace_path_is_case_sensitive(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1)})
+        before = self.index.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.import_records({"a.md": self.record("a.md", bytes=2)},
+                                     replace_paths=["A.md"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_replace_paths_parameter_type_validation(self):
+        bad_replacements = ["a.md", {"a.md"}, 7, None, ["a.md", 1], ["a.md", None]]
+        for replace_paths in bad_replacements:
+            with self.assertRaises(ValueError):
+                self.room.import_records({"a.md": self.record("a.md")},
+                                         replace_paths=replace_paths)
+            with self.assertRaises(ValueError):
+                self.room.preview_import({"a.md": self.record("a.md")},
+                                         replace_paths=replace_paths)
+
+    def test_replace_invalid_records_still_fail(self):
+        self.room.import_records({"a.md": self.record("a.md"),
+                                  "b.md": self.record("b.md")})
+        before = self.index.read_text(encoding="utf-8")
+        # A malformed record elsewhere in the batch fails even when approved.
+        with self.assertRaises(ValueError):
+            self.room.import_records(
+                {"a.md": self.record("a.md", tags="legal"),
+                 "junk.md": ["not", "a", "record"]},
+                replace_paths=["a.md"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_replace_validates_references_on_both_sides(self):
+        self.room.import_records({"a.md": self.record("a.md", references=["b.md"]),
+                                  "b.md": self.record("b.md")})
+        # The incoming replacement must not introduce a dangling target.
+        with self.assertRaises(ValueError):
+            self.room.import_records(
+                {"a.md": self.record("a.md", references=["ghost.md"])},
+                replace_paths=["a.md"])
+        # Targets introduced by another batch record resolve via the union.
+        result = self.room.import_records(
+            {"a.md": self.record("a.md", references=["c.md"]),
+             "c.md": self.record("c.md", references=["a.md", "c.md"])},
+            replace_paths=["a.md"])
+        self.assertEqual(result["replaced"], ["a.md"])
+        self.assertEqual(result["added"], ["c.md"])
+        # A dangling reference hidden on the old replaced record is still caught.
+        self.index.write_text(json.dumps({
+            "a.md": self.record("a.md", references=["gone.md"]),
+            "b.md": self.record("b.md")}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.import_records(
+                {"a.md": self.record("a.md", references=["b.md"]),
+                 "c.md": self.record("c.md")},
+                replace_paths=["a.md"])
+        # A target the old record names but only the batch provides resolves
+        # against the union, so the replacement goes through.
+        self.index.write_text(json.dumps({
+            "a.md": self.record("a.md", references=["c.md"]),
+            "b.md": self.record("b.md")}), encoding="utf-8")
+        result = self.room.import_records(
+            {"a.md": self.record("a.md", references=["b.md"]),
+             "c.md": self.record("c.md")},
+            replace_paths=["a.md"])
+        self.assertEqual(result, {"added": ["c.md"], "unchanged": [],
+                                  "replaced": ["a.md"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["a.md"],
+                         self.record("a.md", references=["b.md"]))
+
+    def test_preview_replace_classifies_replaced_and_remaining_conflicts(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1),
+                                  "b.md": self.record("b.md", bytes=1,
+                                                      archived=True)})
+        batch = {"a.md": self.record("a.md", bytes=2),
+                 "b.md": self.record("b.md", bytes=2),
+                 "new.md": self.record("new.md")}
+        preview = self.room.preview_import(batch, replace_paths=["a.md"])
+        self.assertFalse(preview["can_import"])
+        self.assertEqual(preview["added"], ["new.md"])
+        self.assertEqual(preview["unchanged"], [])
+        self.assertEqual([c["path"] for c in preview["conflicts"]], ["b.md"])
+        self.assertEqual(preview["conflicts"][0]["fields"],
+                         ["archived", "bytes"])
+        self.assertEqual(preview["replaced"], [
+            {"path": "a.md",
+             "existing": self.record("a.md", bytes=1),
+             "incoming": self.record("a.md", bytes=2),
+             "fields": ["bytes"]}])
+        # The four categories are mutually exclusive and path-sorted.
+        paths = (preview["added"] + preview["unchanged"]
+                 + [c["path"] for c in preview["conflicts"]]
+                 + [r["path"] for r in preview["replaced"]])
+        self.assertEqual(len(paths), len(set(paths)))
+
+    def test_preview_replace_can_import_when_every_conflict_approved(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1),
+                                  "b.md": self.record("b.md")})
+        preview = self.room.preview_import(
+            {"a.md": self.record("a.md", bytes=2),
+             "b.md": self.record("b.md")},
+            replace_paths=["a.md"])
+        self.assertTrue(preview["can_import"])
+        self.assertEqual(preview["conflicts"], [])
+        self.assertEqual([r["path"] for r in preview["replaced"]], ["a.md"])
+        self.assertEqual(preview["unchanged"], ["b.md"])
+
+    def test_preview_replace_is_read_only_and_keeps_input(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1)})
+        before = self.index.read_text(encoding="utf-8")
+        batch = {"a.md": self.record("a.md", bytes=2)}
+        batch_snapshot = json.loads(json.dumps(batch))
+        preview = self.room.preview_import(batch, replace_paths=["a.md"])
+        self.assertTrue(preview["can_import"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        self.assertEqual(batch, batch_snapshot)
+        nested = DocumentRoom(self.root, self.root / "deep" / "index.json")
+        with self.assertRaises(ValueError):
+            nested.preview_import({"x.md": self.record("x.md")},
+                                  replace_paths=["x.md"])
+        self.assertFalse((self.root / "deep").exists())
+
+    def test_empty_replace_list_keeps_original_output_shape(self):
+        self.room.import_records({"a.md": self.record("a.md", bytes=1)})
+        incoming = {"a.md": self.record("a.md", bytes=2)}
+        self.assertEqual(set(self.room.preview_import(incoming)),
+                         {"can_import", "added", "unchanged", "conflicts"})
+        self.assertEqual(
+            set(self.room.preview_import(incoming, replace_paths=[])),
+            {"can_import", "added", "unchanged", "conflicts"})
+        self.assertEqual(
+            set(self.room.preview_import(incoming, replace_paths=())),
+            {"can_import", "added", "unchanged", "conflicts"})
+        self.room.import_records({"b.md": self.record("b.md")})
+        self.assertEqual(set(self.room.import_records(
+            {"b.md": self.record("b.md")}, replace_paths=[])),
+            {"added", "unchanged"})
+
+    def test_cli_replace_flag(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        batch_path = self.root / "batch.json"
+        self.room.import_records({"a.md": self.record("a.md", bytes=1),
+                                  "b.md": self.record("b.md", bytes=1)})
+        before = self.index.read_text(encoding="utf-8")
+        batch = {"a.md": self.record("a.md", bytes=2,
+                                     extra={"keep": [3, 1, 2]}),
+                 "b.md": self.record("b.md", bytes=2)}
+        batch_path.write_text(json.dumps(batch), encoding="utf-8")
+        # One replacement approved, one conflict left: error JSON, exit 2.
+        result = subprocess.run(prefix + ["import", "--from", str(batch_path),
+                                          "--replace", "a.md"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # Approve both paths; the repeated flag handles each key once.
+        result = subprocess.run(
+            prefix + ["import", "--from", str(batch_path),
+                      "--replace", "a.md", "--replace", "b.md",
+                      "--replace", "a.md"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"added": [], "unchanged": [],
+                          "replaced": ["a.md", "b.md"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["a.md"], batch["a.md"])
+        self.assertEqual(stored["b.md"], batch["b.md"])
+        # A replace path missing from the index or batch exits 2.
+        result = subprocess.run(
+            prefix + ["import", "--from", str(batch_path),
+                      "--replace", "ghost.md"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
+    def test_cli_preview_replace_output_and_exit_codes(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        batch_path = self.root / "batch.json"
+        self.room.import_records({"a.md": self.record("a.md", bytes=1),
+                                  "b.md": self.record("b.md", bytes=1)})
+        before = self.index.read_text(encoding="utf-8")
+        batch = {"a.md": self.record("a.md", bytes=2),
+                 "b.md": self.record("b.md", bytes=2)}
+        batch_path.write_text(json.dumps(batch), encoding="utf-8")
+        # One approved, one still conflicting: complete preview, exit 0.
+        result = subprocess.run(
+            prefix + ["import", "--preview", "--from", str(batch_path),
+                      "--replace", "a.md"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["can_import"])
+        self.assertEqual([c["path"] for c in payload["conflicts"]], ["b.md"])
+        self.assertEqual([r["path"] for r in payload["replaced"]], ["a.md"])
+        self.assertEqual(payload["replaced"][0]["existing"],
+                         self.record("a.md", bytes=1))
+        self.assertEqual(payload["replaced"][0]["incoming"],
+                         self.record("a.md", bytes=2))
+        self.assertEqual(payload["replaced"][0]["fields"], ["bytes"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # Approving both makes the preview importable while still read-only.
+        result = subprocess.run(
+            prefix + ["import", "--preview", "--from", str(batch_path),
+                      "--replace", "a.md", "--replace", "b.md"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["can_import"])
+        self.assertEqual(payload["conflicts"], [])
+        self.assertEqual([r["path"] for r in payload["replaced"]],
+                         ["a.md", "b.md"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
 
 class DumpTests(unittest.TestCase):
     def setUp(self):
