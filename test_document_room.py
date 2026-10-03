@@ -803,6 +803,252 @@ class DocumentRoomTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("error", json.loads(result.stdout))
 
+    def _register_reference_graph(self, graph):
+        records = {}
+        for path, references in graph.items():
+            record = {"path": path, "name": Path(path).name, "bytes": 1,
+                      "sha256": "h" + path, "tags": []}
+            if references is not None:
+                record["references"] = references
+            records[path] = record
+        self.index.write_text(json.dumps(records), encoding="utf-8")
+
+    def test_find_reference_cycles_mutual_pairs_sharing_member_form_one_group(self):
+        # a <-> b and b <-> c: one maximal group containing all three.
+        self._register_reference_graph(
+            {"a.txt": ["b.txt"], "b.txt": ["a.txt", "c.txt"], "c.txt": ["b.txt"]})
+        result = self.room.find_reference_cycles()
+        self.assertEqual(set(result), {"groups"})
+        (group,) = result["groups"]
+        self.assertEqual(set(group), {"matched", "documents"})
+        self.assertEqual(group["matched"], ["a.txt", "b.txt", "c.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]],
+                         ["a.txt", "b.txt", "c.txt"])
+
+    def test_find_reference_cycles_independent_rings_stay_separate(self):
+        # Two mutual pairs linked only one-way (b.txt -> d.txt) do not merge.
+        self._register_reference_graph({
+            "a.txt": ["b.txt"], "b.txt": ["a.txt", "d.txt"],
+            "c.txt": ["d.txt"], "d.txt": ["c.txt"]})
+        groups = self.room.find_reference_cycles()["groups"]
+        self.assertEqual([[d["path"] for d in g["documents"]] for g in groups],
+                         [["a.txt", "b.txt"], ["c.txt", "d.txt"]])
+
+    def test_find_reference_cycles_excludes_one_way_neighbors(self):
+        # x.txt only points at the ring and z.txt is only pointed at by it.
+        self._register_reference_graph({
+            "x.txt": ["b.txt"], "a.txt": ["b.txt"],
+            "b.txt": ["a.txt", "z.txt"], "z.txt": []})
+        (group,) = self.room.find_reference_cycles()["groups"]
+        self.assertEqual([d["path"] for d in group["documents"]], ["a.txt", "b.txt"])
+
+    def test_find_reference_cycles_self_reference_is_single_member_group(self):
+        self._register_reference_graph({"solo.txt": ["solo.txt"]})
+        (group,) = self.room.find_reference_cycles()["groups"]
+        self.assertEqual(group["matched"], ["solo.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]], ["solo.txt"])
+        # A lone record without a direct self-reference is never a group.
+        self._register_reference_graph({"solo.txt": []})
+        self.assertEqual(self.room.find_reference_cycles(), {"groups": []})
+        self._register_reference_graph({"solo.txt": None})
+        self.assertEqual(self.room.find_reference_cycles(), {"groups": []})
+
+    def test_find_reference_cycles_groups_sorted_by_smallest_member(self):
+        self._register_reference_graph({
+            "z1.txt": ["z2.txt"], "z2.txt": ["z1.txt"],
+            "a1.txt": ["a2.txt"], "a2.txt": ["a1.txt"]})
+        result = self.room.find_reference_cycles()
+        self.assertEqual([g["documents"][0]["path"] for g in result["groups"]],
+                         ["a1.txt", "z1.txt"])
+
+    def test_find_reference_cycles_filters_return_whole_group(self):
+        self._register_reference_graph(
+            {"a.txt": ["b.txt"], "b.txt": ["c.txt"], "c.txt": ["a.txt"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["a.txt"]["tags"] = ["release"]
+        stored["c.txt"]["tags"] = ["draft"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        group = self.room.find_reference_cycles([" RELEASE "])["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]],
+                         ["a.txt", "b.txt", "c.txt"])
+        # Case-insensitive path substring follows search semantics.
+        group = self.room.find_reference_cycles(text="B.TXT")["groups"][0]
+        self.assertEqual(group["matched"], ["b.txt"])
+        # A tag no member carries yields nothing; AND tags must hit one member.
+        self.assertEqual(self.room.find_reference_cycles(["finance"]), {"groups": []})
+        self.assertEqual(
+            self.room.find_reference_cycles(["release", "draft"]), {"groups": []})
+
+    def test_find_reference_cycles_archive_and_category_filters(self):
+        self._register_reference_graph(
+            {"a.txt": ["b.txt"], "b.txt": ["c.txt"], "c.txt": ["a.txt"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["a.txt"]["archived"] = True
+        stored["b.txt"]["category"] = "Legal"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        group = self.room.find_reference_cycles(archive_state="archived")["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in group["documents"]],
+                         ["a.txt", "b.txt", "c.txt"])
+        self.assertEqual(
+            self.room.find_reference_cycles(
+                text="a.txt", archive_state="active"), {"groups": []})
+        group = self.room.find_reference_cycles(category=" Legal ")["groups"][0]
+        self.assertEqual(group["matched"], ["b.txt"])
+        # An explicit empty string selects only uncategorized members.
+        group = self.room.find_reference_cycles(category="")["groups"][0]
+        self.assertEqual(group["matched"], ["a.txt", "c.txt"])
+
+    def test_find_reference_cycles_keeps_stored_fields_and_reads_index_only(self):
+        self._register_reference_graph(
+            {"a.txt": ["b.txt"], "b.txt": ["a.txt"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["a.txt"]["category"] = "Legal"
+        stored["a.txt"]["version_note"] = "note"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        before = self.index.read_text(encoding="utf-8")
+        result = self.room.find_reference_cycles()
+        records = {d["path"]: d for d in result["groups"][0]["documents"]}
+        self.assertEqual(records["a.txt"]["category"], "Legal")
+        self.assertEqual(records["a.txt"]["version_note"], "note")
+        self.assertNotIn("status", records["a.txt"])
+        # Records without an optional stored field do not gain one.
+        self.assertNotIn("category", records["b.txt"])
+        # Live file changes never affect the index-only result.
+        (self.root / "a.txt").write_text("totally changed now", encoding="utf-8")
+        self.assertEqual(self.room.find_reference_cycles(), result)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_find_reference_cycles_order_independence(self):
+        records = {}
+        for path, references in {
+                "a.txt": ["b.txt"], "b.txt": ["c.txt", "a.txt"],
+                "c.txt": ["b.txt"]}.items():
+            record = {"path": path, "name": path, "bytes": 1,
+                      "sha256": "h" + path, "tags": [], "references": references}
+            records[path] = record
+        self.index.write_text(json.dumps(records), encoding="utf-8")
+        expected = self.room.find_reference_cycles()
+        # Reordered index keys alone leave every stored record identical.
+        reversed_records = {path: records[path] for path in reversed(list(records))}
+        self.index.write_text(json.dumps(reversed_records), encoding="utf-8")
+        self.assertEqual(self.room.find_reference_cycles(), expected)
+        # A reordered references array changes nothing about membership.
+        reversed_records["b.txt"]["references"] = ["a.txt", "c.txt"]
+        self.index.write_text(json.dumps(reversed_records), encoding="utf-8")
+        result = self.room.find_reference_cycles()
+        self.assertEqual([d["path"] for g in result["groups"] for d in g["documents"]],
+                         ["a.txt", "b.txt", "c.txt"])
+        self.assertEqual(result["groups"][0]["matched"], ["a.txt", "b.txt", "c.txt"])
+
+    def test_find_reference_cycles_without_index_returns_empty_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        self.assertEqual(fresh.find_reference_cycles(), {"groups": []})
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_find_reference_cycles_validation(self):
+        self._register_reference_graph({"a.txt": ["a.txt"]})
+        for bad in (None, 7, "legal", {"x"}, [1], [None]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(bad)
+        for bad in (None, 7, ["x"], b"x"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(text=bad)
+        for bad in (None, 7, "active "):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(archive_state=bad)
+        for bad in (7, b"x", ["x"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.room.find_reference_cycles(category=bad)
+
+    def test_find_reference_cycles_rejects_corrupt_index_even_unrelated(self):
+        # A bad record outside every group still invalidates the whole query.
+        self._register_reference_graph({
+            "a.txt": ["b.txt"], "b.txt": ["a.txt"], "bad.txt": []})
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        stored = json.loads(valid)
+        stored["bad.txt"]["sha256"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles(text="a.txt")
+        stored = json.loads(valid)
+        stored["bad.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        stored = json.loads(valid)
+        stored["bad.txt"]["references"] = "a.txt"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        stored = json.loads(valid)
+        stored["bad.txt"]["tags"] = "x"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        stored = json.loads(valid)
+        stored["bad.txt"]["category"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        stored = json.loads(valid)
+        stored["bad.txt"]["version_note"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.find_reference_cycles()
+        self.index.write_text(valid, encoding="utf-8")
+        self.assertEqual(len(self.room.find_reference_cycles()["groups"]), 1)
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.find_reference_cycles()
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_find_reference_cycles_does_not_mutate_records(self):
+        self._register_reference_graph(
+            {"a.txt": ["b.txt"], "b.txt": ["a.txt"]})
+        snapshot = self.index.read_text(encoding="utf-8")
+        self.room.find_reference_cycles(["release"], "a", "archived", "")
+        self.assertEqual(self.index.read_text(encoding="utf-8"), snapshot)
+
+    def test_cli_reference_cycles_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root),
+                  "--index", str(self.index)]
+        self._register_reference_graph({
+            "a.txt": ["b.txt"], "b.txt": ["a.txt", "c.txt"], "c.txt": ["b.txt"]})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["a.txt"]["tags"] = ["release"]
+        stored["a.txt"]["archived"] = True
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["reference-cycles", "--tag", "RELEASE", "--archive-state", "archived"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(len(payload["groups"]), 1)
+        self.assertEqual(payload["groups"][0]["matched"], ["a.txt"])
+        self.assertEqual([d["path"] for d in payload["groups"][0]["documents"]],
+                         ["a.txt", "b.txt", "c.txt"])
+        # No group matches: empty groups payload, still exit 0.
+        result = subprocess.run(prefix + ["reference-cycles", "--tag", "finance"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"groups": []})
+        # A bad filter value and a corrupt index both yield exit 2 with error.
+        result = subprocess.run(prefix + ["reference-cycles", "--archive-state", "bogus"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        self.index.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["reference-cycles"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+
     def test_cli_refs_and_export_with_references(self):
         prefix = [sys.executable, str(ROOT / "document_room.py"), "--root", str(self.root), "--index", str(self.index)]
         self.room.add("policy.md", ["legal"])

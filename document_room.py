@@ -601,6 +601,95 @@ class DocumentRoom:
         groups.sort(key=lambda group: group["documents"][0]["path"])
         return {"groups": groups}
 
+    def find_reference_cycles(self, tags=(), text="", archive_state="all", category=None):
+        if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must be a list or tuple of strings")
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        self._check_archive_state(archive_state)
+        self._check_category_filter(category)
+        # The cycle structure is computed from the whole index first, so every
+        # stored record — including records no group will return — is validated.
+        records = self._load_validated_with_version_notes()
+        wanted = {tag.strip().lower() for tag in tags if tag.strip()}
+
+        def matches(path):
+            record = records[path]
+            return (wanted.issubset(record["tags"])
+                    and text.casefold() in path.casefold()
+                    and self._matches_archive_state(record, archive_state)
+                    and self._matches_category(record, category))
+
+        # Tarjan's algorithm gives the maximal sets in which every two distinct
+        # paths reach each other along reference edges: rings sharing a member
+        # become one group, independent rings joined only by one-way edges do
+        # not, and a document that only points at or is only pointed at by a
+        # ring never joins it. An explicit work stack keeps long one-way chains
+        # from depending on the Python recursion limit, and a fixed iteration
+        # order over sorted path keys keeps the output independent of index or
+        # references array order.
+        paths = sorted(records)
+        successors = {path: records[path].get("references", []) for path in paths}
+        index_of = {}
+        lowlink = {}
+        stack = []
+        on_stack = set()
+        counter = 0
+        components = []
+        for start in paths:
+            if start in index_of:
+                continue
+            index_of[start] = lowlink[start] = counter
+            counter += 1
+            stack.append(start)
+            on_stack.add(start)
+            work = [(start, 0)]
+            while work:
+                node, edge_index = work[-1]
+                targets = successors[node]
+                if edge_index < len(targets):
+                    target = targets[edge_index]
+                    work[-1] = (node, edge_index + 1)
+                    if target not in index_of:
+                        index_of[target] = lowlink[target] = counter
+                        counter += 1
+                        stack.append(target)
+                        on_stack.add(target)
+                        work.append((target, 0))
+                    elif target in on_stack:
+                        lowlink[node] = min(lowlink[node], index_of[target])
+                else:
+                    work.pop()
+                    if work:
+                        parent = work[-1][0]
+                        lowlink[parent] = min(lowlink[parent], lowlink[node])
+                    if lowlink[node] == index_of[node]:
+                        members = []
+                        while True:
+                            member = stack.pop()
+                            on_stack.remove(member)
+                            members.append(member)
+                            if member == node:
+                                break
+                        components.append(members)
+        groups = []
+        for members in components:
+            if len(members) == 1:
+                member = members[0]
+                # A lone record forms a group only when it references itself.
+                if member not in successors[member]:
+                    continue
+            ordered = sorted(members)
+            # A filter hitting any single member returns the whole group; the
+            # other members are not required to match.
+            matched = [path for path in ordered if matches(path)]
+            if not matched:
+                continue
+            groups.append({"matched": matched,
+                           "documents": [records[path] for path in ordered]})
+        groups.sort(key=lambda group: group["documents"][0]["path"])
+        return {"groups": groups}
+
     def merge_duplicates(self, keep, sources):
         if not isinstance(keep, str):
             raise ValueError("keep path must be a string")
@@ -1008,6 +1097,11 @@ def main():
     duplicates = commands.add_parser("duplicates")
     duplicates.add_argument("--tag", action="append", default=[])
     duplicates.add_argument("--text", default="")
+    cycles = commands.add_parser("reference-cycles")
+    cycles.add_argument("--tag", action="append", default=[])
+    cycles.add_argument("--text", default="")
+    cycles.add_argument("--archive-state", default="all")
+    cycles.add_argument("--category", default=None)
     merge = commands.add_parser("merge-duplicates")
     merge.add_argument("path")
     merge.add_argument("--from", dest="sources", action="append", default=[])
@@ -1072,6 +1166,9 @@ def main():
                                            include_routes=args.with_routes)
         elif args.command == "duplicates":
             result = room.find_duplicates(args.tag, args.text)
+        elif args.command == "reference-cycles":
+            result = room.find_reference_cycles(args.tag, args.text,
+                                               args.archive_state, args.category)
         elif args.command == "merge-duplicates":
             result = room.merge_duplicates(args.path, args.sources)
         elif args.command == "compare":

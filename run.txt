@@ -31,6 +31,8 @@ python3 document_room.py impact meeting.txt
 Lists registered documents that reference the target, each with its minimum reference-edge distance; --transitive also includes indirect referrers, and --with-routes adds one shortest reference chain per document.
 python3 document_room.py duplicates --tag release
 Groups registrations with equal stored bytes and SHA-256 into duplicate groups; --tag (repeatable) and --text filter like search and any member match returns the whole group.
+python3 document_room.py reference-cycles --tag release
+Finds maximal cyclic groups in the stored reference graph (index only; files are never read); --tag (repeatable), --text, --archive-state and --category filter like search, a self-reference yields a one-member group, rings sharing a member merge while one-way linked rings stay separate, and any member match returns the whole group with matched and sorted full records.
 python3 document_room.py merge-duplicates a.txt --from b.txt --from c.txt
 Merges duplicate registrations into the keep record (index only; files are never read): every source must be registered with equal stored bytes and SHA-256, other records' references to a source are rewritten to the keep path preserving order and duplicates, and the keep record collects all participants' direct references deduplicated and sorted, printing kept, removed and updated.
 python3 document_room.py compare --before old.json --after new.json
