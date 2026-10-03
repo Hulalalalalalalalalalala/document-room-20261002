@@ -39,6 +39,10 @@ python3 document_room.py compare --before old.json --after new.json
 Diffs two exported manifest snapshots into added, removed, changed and unchanged documents without touching the index or files; --detect-relocations additionally merges leftover pairs with identical stored bytes and SHA-256 (unique on both sides) into a relocated array, and --compare-version-notes also diffs the version_note field (exact string comparison, missing equals empty, non-string notes fail with exit 2).
 python3 document_room.py import --from records.json
 Merges a UTF-8 JSON object of path-keyed records into the index (metadata only; files are not read), reporting added and unchanged paths; conflicting or invalid records fail the whole batch with exit 2.
+python3 document_room.py import --from records.json --replace old.md --replace other.md
+Same merge, but each repeatable --replace authorizes replacing the record at that exact case-sensitive index key with the incoming complete record (no field merging; the path must exist in both the index and the batch, duplicates count once); unauthorized conflicts still fail the whole batch, and a non-empty list adds a sorted replaced array to the JSON result.
 python3 document_room.py import --preview --from records.json
 Previews an import without writing: prints can_import plus added, unchanged and conflicts (each conflict keeps both full records and the sorted differing top-level fields); conflicts still exit 0, malformed input, dangling references or corrupt JSON/UTF-8 exit 2, and nothing is created or modified.
+python3 document_room.py import --preview --from records.json --replace old.md
+Previews with the same --replace authorization: authorized same-path differences move into a replaced array of conflict-shaped items, conflicts lists only the rest, can_import is true only when that is empty, and the full preview still exits 0 without writing.
 python3 -B -m unittest -v

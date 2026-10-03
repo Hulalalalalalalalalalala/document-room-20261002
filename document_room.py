@@ -430,10 +430,33 @@ class DocumentRoom:
                       if existing[field] != incoming[field])
         return sorted(fields)
 
-    def preview_import(self, batch):
+    @staticmethod
+    def _check_replace_paths(replace_paths):
+        # Paths are the index's raw case-sensitive keys: never stripped,
+        # normalized or resolved against the filesystem, and a repeated path
+        # is authorized only once.
+        if not isinstance(replace_paths, (list, tuple)):
+            raise ValueError("replace_paths must be a list or tuple of strings")
+        if not all(isinstance(path, str) for path in replace_paths):
+            raise ValueError("replace_paths must contain only strings")
+        return set(replace_paths)
+
+    def _check_replace_paths_present(self, replace_set, existing, batch):
+        # Every authorized path must identify a record on both sides; a path
+        # missing from either side fails validation instead of silently
+        # behaving like an ordinary add or no-op.
+        for path in sorted(replace_set):
+            if path not in existing or path not in batch:
+                raise ValueError("replace path must exist in the index and batch: "
+                                 + path)
+
+    def preview_import(self, batch, replace_paths=()):
+        replace_set = self._check_replace_paths(replace_paths)
         existing = self._prepare_import(batch)
+        self._check_replace_paths_present(replace_set, existing, batch)
         added = []
         unchanged = []
+        replaced = []
         conflicts = []
         for key in sorted(set(existing) | set(batch)):
             if key not in existing:
@@ -443,44 +466,74 @@ class DocumentRoom:
             elif existing[key] == batch[key]:  # field set and values, arrays ordered
                 unchanged.append(key)
             else:
-                conflicts.append({"path": key, "existing": existing[key],
-                                  "incoming": batch[key],
-                                  "fields": self._import_field_differences(
-                                      existing[key], batch[key])})
+                # A replacement carries the same full-payload conflict shape;
+                # identical records on an authorized path stay unchanged.
+                item = {"path": key, "existing": existing[key],
+                        "incoming": batch[key],
+                        "fields": self._import_field_differences(
+                            existing[key], batch[key])}
+                if key in replace_set:
+                    replaced.append(item)
+                else:
+                    conflicts.append(item)
         # Reference targets are resolved against the union of registered paths
         # and batch paths, checked on every record of both sides so a
-        # conflicting record can neither introduce nor hide a dangling target.
+        # conflicting or replaced record can neither introduce nor hide a
+        # dangling target.
         for records in (existing, batch):
             for record in records.values():
                 for target in record.get("references", []):
                     if target not in existing and target not in batch:
                         raise ValueError("record references an unregistered path")
-        return {"can_import": not conflicts,
-                "added": added, "unchanged": unchanged, "conflicts": conflicts}
+        result = {"can_import": not conflicts,
+                  "added": added, "unchanged": unchanged, "conflicts": conflicts}
+        if replace_set:  # the key exists only when a non-empty list was given
+            result["replaced"] = replaced
+        return result
 
-    def import_records(self, batch):
+    def import_records(self, batch, replace_paths=()):
+        replace_set = self._check_replace_paths(replace_paths)
         existing = self._prepare_import(batch)
+        self._check_replace_paths_present(replace_set, existing, batch)
         added = []
         unchanged = []
+        replaced = []
         for key, record in batch.items():
             if key not in existing:
                 added.append(key)
             elif existing[key] == record:  # field set and values, arrays ordered
                 unchanged.append(key)
+            elif key in replace_set:
+                # The incoming record replaces the whole stored record: no
+                # field merging, incoming array order, extra fields and the
+                # presence or absence of optional fields all win verbatim.
+                replaced.append(key)
             else:
                 raise ValueError("import conflicts with the existing record: " + key)
         merged = dict(existing)
-        for key in added:
+        for key in added + replaced:
             merged[key] = batch[key]
-        for record in merged.values():
-            for target in record.get("references", []):
-                if target not in merged:
-                    raise ValueError("record references an unregistered path")
-        if added:
+        if replace_set:
+            # Both sides are checked: an old record being replaced must not
+            # hide a dangling reference either.
+            for records in (existing, batch):
+                for record in records.values():
+                    for target in record.get("references", []):
+                        if target not in existing and target not in batch:
+                            raise ValueError("record references an unregistered path")
+        else:
+            for record in merged.values():
+                for target in record.get("references", []):
+                    if target not in merged:
+                        raise ValueError("record references an unregistered path")
+        if added or replaced:  # no new records and no actual replacements: no write
             self.index.parent.mkdir(parents=True, exist_ok=True)
             self.index.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
                                   encoding="utf-8")
-        return {"added": sorted(added), "unchanged": sorted(unchanged)}
+        result = {"added": sorted(added), "unchanged": sorted(unchanged)}
+        if replace_set:  # the key exists only when a non-empty list was given
+            result["replaced"] = sorted(replaced)
+        return result
 
     def export_records(self, tags=(), text="", archive_state="all", category=None):
         if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
@@ -1123,6 +1176,7 @@ def main():
     importer = commands.add_parser("import")
     importer.add_argument("--from", dest="from_path", required=True)
     importer.add_argument("--preview", action="store_true")
+    importer.add_argument("--replace", action="append", default=[])
     dump = commands.add_parser("dump")
     dump.add_argument("--tag", action="append", default=[])
     dump.add_argument("--text", default="")
@@ -1184,8 +1238,9 @@ def main():
                 raise ValueError(f"import file is not valid UTF-8: {exc}")
             except json.JSONDecodeError as exc:
                 raise ValueError(f"import file is not valid JSON: {exc}")
-            result = (room.preview_import(batch) if args.preview
-                      else room.import_records(batch))
+            result = (room.preview_import(batch, replace_paths=args.replace)
+                      if args.preview
+                      else room.import_records(batch, replace_paths=args.replace))
         elif args.command == "dump":
             result = room.export_records(args.tag, args.text, args.archive_state,
                                          args.category)
