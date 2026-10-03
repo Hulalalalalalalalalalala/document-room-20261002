@@ -601,6 +601,64 @@ class DocumentRoom:
         groups.sort(key=lambda group: group["documents"][0]["path"])
         return {"groups": groups}
 
+    def merge_duplicates(self, keep, sources):
+        if not isinstance(keep, str):
+            raise ValueError("keep path must be a string")
+        if (not isinstance(sources, (list, tuple)) or not sources
+                or not all(isinstance(source, str) for source in sources)):
+            raise ValueError("sources must be a non-empty list or tuple of strings")
+        # The whole index must be structurally sound before anything changes.
+        records = self._load_validated_with_version_notes()
+        if keep not in records:
+            raise ValueError("keep document is not registered")
+        unique_sources = list(dict.fromkeys(sources))  # duplicates handled once
+        if keep in unique_sources:
+            raise ValueError("sources must not contain the keep path")
+        for source in unique_sources:
+            if source not in records:
+                raise ValueError("source document is not registered: " + source)
+        kept = records[keep]
+        for source in unique_sources:
+            record = records[source]
+            # Content metadata compares as stored: the digest's exact string.
+            if record["bytes"] != kept["bytes"] or record["sha256"] != kept["sha256"]:
+                raise ValueError("source content metadata does not match the keep record")
+        merging = set(unique_sources)
+        participants = [keep] + unique_sources
+        # The keep record collects its own and every source's original direct
+        # references, source paths replaced by the keep path, deduplicated and
+        # sorted case-sensitively. The field is stored only when at least one
+        # participant originally carried it.
+        after = dict(kept)
+        if any("references" in records[path] for path in participants):
+            after["references"] = sorted({
+                keep if target in merging else target
+                for path in participants
+                for target in records[path].get("references", [])})
+        removed = [dict(records[source]) for source in unique_sources]
+        # Every other surviving record's references to a source follow it to
+        # the keep path; order and duplicates are preserved and records
+        # without references stay untouched.
+        updated = []
+        new_records = {}
+        for key, record in records.items():
+            if key in merging:
+                continue
+            if key == keep:
+                new_records[key] = after
+                continue
+            if "references" in record and any(
+                    target in merging for target in record["references"]):
+                record["references"] = [keep if target in merging else target
+                                        for target in record["references"]]
+                updated.append(record)
+            new_records[key] = record
+        self.index.write_text(json.dumps(new_records, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+        return {"kept": after,
+                "removed": sorted(removed, key=lambda record: record["path"]),
+                "updated": sorted(updated, key=lambda record: record["path"])}
+
     def _file_status(self, record):
         try:
             path = (self.root / record["path"]).resolve()
@@ -950,6 +1008,9 @@ def main():
     duplicates = commands.add_parser("duplicates")
     duplicates.add_argument("--tag", action="append", default=[])
     duplicates.add_argument("--text", default="")
+    merge = commands.add_parser("merge-duplicates")
+    merge.add_argument("path")
+    merge.add_argument("--from", dest="sources", action="append", default=[])
     export = commands.add_parser("export")
     export.add_argument("--release", default="")
     export.add_argument("--tag", action="append", default=[])
@@ -1011,6 +1072,8 @@ def main():
                                            include_routes=args.with_routes)
         elif args.command == "duplicates":
             result = room.find_duplicates(args.tag, args.text)
+        elif args.command == "merge-duplicates":
+            result = room.merge_duplicates(args.path, args.sources)
         elif args.command == "compare":
             result = room.compare_manifest_files(
                 args.before, args.after,
