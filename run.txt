@@ -23,6 +23,8 @@ python3 document_room.py relocate meeting.txt docs/meeting.txt
 Moves a registration from the old exact index key to the new file's canonical root-relative path after you move the file yourself (index only; the file must exist inside the root with the same bytes and SHA-256); all references, including self-references, are rewritten to the new key, printing before, after and updated.
 python3 document_room.py export --release "Q4 Launch"
 Checks the registered files and reports ready, changed, missing, unsafe or unreadable; complete is true only when every listed document is ready.
+python3 document_room.py export --release "Q4 Launch" --with-references --with-blockers
+Adds a blockers array (requires --with-references): only blocked starting documents appear, each listing itself and every reachable non-ready document with status, minimum reference-edge distance and one lexicographically-smallest shortest route; combines with --with-origins and --with-version-notes.
 python3 document_room.py impact meeting.txt
 Lists registered documents that reference the target, each with its minimum reference-edge distance; --transitive also includes indirect referrers, and --with-routes adds one shortest reference chain per document.
 python3 document_room.py duplicates --tag release

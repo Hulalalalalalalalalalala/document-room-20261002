@@ -472,9 +472,49 @@ class DocumentRoom:
         except (OSError, RuntimeError, ValueError):
             return "unreadable"
 
+    @staticmethod
+    def _release_blockers(records, starts, status_by_path):
+        # Reverse reference edges, used to reconstruct shortest routes after
+        # the breadth-first distances are known.
+        referrers = {}
+        for source, record in records.items():
+            for target in record.get("references", []):
+                referrers.setdefault(target, set()).add(source)
+        blockers = []
+        for start in sorted(starts):
+            distances = {start: 0}
+            frontier = [start]
+            while frontier:  # abnormal intermediate nodes never stop the walk
+                nxt = []
+                for node in frontier:
+                    for target in records[node].get("references", []):
+                        if target not in distances:
+                            distances[target] = distances[node] + 1
+                            nxt.append(target)
+                frontier = nxt
+            routes = {start: [start]}
+            abnormal = []
+            # Nodes by rising depth keep every predecessor's best route known.
+            for key in sorted(distances, key=lambda key: (distances[key], key)):
+                if key != start:
+                    # Equal-length chains tie-break on the case-sensitive
+                    # lexicographic order of the full path array.
+                    routes[key] = min(
+                        routes[predecessor] + [key]
+                        for predecessor in referrers.get(key, ())
+                        if distances.get(predecessor) == distances[key] - 1)
+                if status_by_path[key] != "ready":
+                    abnormal.append(key)
+            if abnormal:  # starts without a reachable abnormal document are omitted
+                blockers.append({"path": start, "documents": [
+                    {"path": key, "status": status_by_path[key],
+                     "distance": distances[key], "route": routes[key]}
+                    for key in abnormal]})
+        return blockers
+
     def export_manifest(self, release, tags=(), text="", include_references=False,
                         archive_state="all", category=None, include_origins=False,
-                        include_version_notes=False):
+                        include_version_notes=False, include_blockers=False):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
         self._check_archive_state(archive_state)
@@ -485,6 +525,10 @@ class DocumentRoom:
             raise ValueError("include_origins requires include_references")
         if not isinstance(include_version_notes, bool):
             raise ValueError("include_version_notes must be a boolean")
+        if not isinstance(include_blockers, bool):
+            raise ValueError("include_blockers must be a boolean")
+        if include_blockers and not include_references:
+            raise ValueError("include_blockers requires include_references")
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
 
@@ -551,9 +595,15 @@ class DocumentRoom:
                 # export an empty note; referenced documents keep their own.
                 document["version_note"] = record.get("version_note", "")
             documents.append(document)
-        return {"release": release,
-                "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
-                "documents": documents}
+        manifest = {"release": release,
+                    "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
+                    "documents": documents}
+        if include_blockers:
+            # Only starting documents carry a blockers entry, and only when
+            # themselves or a reachable reference is not ready.
+            status_by_path = {document["path"]: document["status"] for document in documents}
+            manifest["blockers"] = self._release_blockers(records, starts, status_by_path)
+        return manifest
 
     @staticmethod
     def _validated_manifest(manifest):
@@ -762,6 +812,7 @@ def main():
     export.add_argument("--with-references", action="store_true")
     export.add_argument("--with-origins", action="store_true")
     export.add_argument("--with-version-notes", action="store_true")
+    export.add_argument("--with-blockers", action="store_true")
     export.add_argument("--archive-state", default="all")
     export.add_argument("--category", default=None)
     compare = commands.add_parser("compare")
@@ -828,7 +879,8 @@ def main():
                                           archive_state=args.archive_state,
                                           category=args.category,
                                           include_origins=args.with_origins,
-                                          include_version_notes=args.with_version_notes)
+                                          include_version_notes=args.with_version_notes,
+                                          include_blockers=args.with_blockers)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:
