@@ -4006,5 +4006,279 @@ class ReleaseBlockerTests(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stdout)), {"error"})
 
 
+class MergeDuplicatesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "a.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "d.txt").write_text("same body\n", encoding="utf-8")
+        (self.root / "c.txt").write_text("Notes\n", encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def record(self, path, **overrides):
+        record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                  "sha256": hashlib.sha256(b"same body\n").hexdigest(),
+                  "tags": ["legal"]}
+        record.update(overrides)
+        return record
+
+    def _register_duplicates(self):
+        a = self.room.add("a.txt", ["release"])
+        b = self.room.add("b.txt", ["draft"])
+        self.room.add("d.txt")
+        c = self.room.add("c.txt", ["operations"])
+        return a, b, c
+
+    def test_merge_basic_example_and_result_shape(self):
+        _, _, c = self._register_duplicates()
+        # 乙 references 丙; nobody references 乙 yet.
+        b = self.room.set_references("b.txt", ["c.txt"])
+        result = self.room.merge_duplicates("a.txt", ["b.txt"])
+        self.assertEqual(set(result), {"kept", "removed", "updated"})
+        self.assertEqual(result["removed"], [b])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["kept"]["path"], "a.txt")
+        # The kept record's expanded references still reach 丙.
+        self.assertEqual(result["kept"]["references"], ["c.txt"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("b.txt", stored)
+        self.assertEqual(stored["a.txt"]["references"], ["c.txt"])
+        self.assertEqual(stored["c.txt"], c)
+
+    def test_merge_repoints_other_records_and_expands_kept_references(self):
+        self._register_duplicates()
+        # b references c; c references b twice; merging b into a rewires both.
+        self.room.set_references("b.txt", ["c.txt"])
+        self.room.set_references("c.txt", ["b.txt"])
+        result = self.room.merge_duplicates("a.txt", ["b.txt"])
+        self.assertEqual([r["path"] for r in result["updated"]], ["c.txt"])
+        self.assertEqual(result["updated"][0]["references"], ["a.txt"])
+        self.assertEqual(result["kept"]["references"], ["c.txt"])
+        manifest = self.room.export_manifest("R1", include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["a.txt", "c.txt", "d.txt"])
+        impact = self.room.reference_impact("a.txt")
+        self.assertEqual([d["path"] for d in impact["documents"]], ["c.txt"])
+
+    def test_merge_is_allowed_for_part_of_a_duplicate_group(self):
+        a, b, _ = self._register_duplicates()
+        result = self.room.merge_duplicates("a.txt", ["b.txt"])
+        self.assertEqual([r["path"] for r in result["removed"]], ["b.txt"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        # d.txt is a third member of the same group and simply survives.
+        self.assertEqual(set(stored), {"a.txt", "c.txt", "d.txt"})
+        self.assertTrue((self.room.find_duplicates()["groups"][0]["matched"] ==
+                         ["a.txt", "d.txt"]))
+        self.assertEqual(stored["a.txt"]["tags"], a["tags"])
+        self.assertEqual(stored["d.txt"]["tags"], [])
+
+    def test_kept_collects_union_with_source_paths_replaced_sorted_deduped(self):
+        batch = {
+            "K": self.record("K", references=["K", "x.md"]),
+            "A": self.record("A", references=["A", "x.md", "K", "A"]),
+            "B": self.record("B", references=["B", "A", "m.md"]),
+            "x.md": self.record("x.md"),
+            "m.md": self.record("m.md"),
+        }
+        self.room.import_records(batch)
+        result = self.room.merge_duplicates("K", ["B", "A"])
+        # K.refs [K,x] plus A.refs [A,x,K,A]->[K,x,K,K] plus B.refs [B,A,m]->[K,K,m]
+        self.assertEqual(result["kept"]["references"], ["K", "m.md", "x.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["K"]["references"], ["K", "m.md", "x.md"])
+        # Self-references and cycles stay legal.
+        self.assertEqual(self.room.set_references("x.md", ["K", "x.md"])["references"],
+                         ["K", "x.md"])
+
+    def test_other_records_rewrite_preserves_order_duplicates_and_fields(self):
+        batch = {
+            "K": self.record("K"),
+            "A": self.record("A"),
+            "B": self.record("B"),
+            "R1": self.record("R1", references=["B", "A", "B", "K", "x.md"],
+                              archived=True, category="Docs", extra={"keep": [1]}),
+            "R2": self.record("R2", references=["A", "A"]),
+            "x.md": self.record("x.md"),
+            "plain": self.record("plain"),
+        }
+        self.room.import_records(batch)
+        result = self.room.merge_duplicates("K", ["A", "B"])
+        self.assertEqual([r["path"] for r in result["updated"]], ["R1", "R2"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["R1"]["references"],
+                         ["K", "K", "K", "K", "x.md"])
+        self.assertTrue(stored["R1"]["archived"])
+        self.assertEqual(stored["R1"]["category"], "Docs")
+        self.assertEqual(stored["R1"]["extra"], {"keep": [1]})
+        self.assertEqual(stored["R2"]["references"], ["K", "K"])
+        # Records without a references field never gain one and are not listed.
+        self.assertNotIn("references", stored["plain"])
+        self.assertFalse(any(r["path"] == "plain" for r in result["updated"]))
+        # The kept record never appears in updated even if it referenced sources.
+        self.assertFalse(any(r["path"] == "K" for r in result["updated"]))
+
+    def test_references_field_presence_rule(self):
+        # None of the participants carries references: the kept record gains none.
+        batch = {"K": self.record("K"), "A": self.record("A"),
+                 "R": self.record("R", references=["A"])}
+        self.room.import_records(batch)
+        result = self.room.merge_duplicates("K", ["A"])
+        self.assertNotIn("references", result["kept"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("references", stored["K"])
+        # A source carrying the field makes the kept record store the union,
+        # even though the kept record itself lacked it.
+        batch = {"K2": self.record("K2"), "A2": self.record("A2", references=["K2"]),
+                "X2": self.record("X2", references=["A2"])}
+        self.room.import_records(batch)
+        result = self.room.merge_duplicates("K2", ["A2"])
+        self.assertEqual(result["kept"]["references"], ["K2"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(stored["K2"]["references"], ["K2"])
+        self.assertEqual(stored["X2"]["references"], ["K2"])
+
+    def test_duplicate_sources_processed_once_and_sorted_in_result(self):
+        batch = {"K": self.record("K"), "A": self.record("A"),
+                 "B": self.record("B"), "R": self.record("R", references=["A", "B"])}
+        self.room.import_records(batch)
+        result = self.room.merge_duplicates("K", ["B", "A", "B", "A"])
+        self.assertEqual([r["path"] for r in result["removed"]], ["A", "B"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"K", "R"})
+        self.assertEqual(stored["R"]["references"], ["K", "K"])
+
+    def test_merge_reads_index_only_and_ignores_live_file_state(self):
+        self._register_duplicates()
+        self.room.set_references("b.txt", ["c.txt"])
+        (self.root / "a.txt").write_text("totally changed now", encoding="utf-8")
+        (self.root / "b.txt").unlink()
+        result = self.room.merge_duplicates("a.txt", ["b.txt"])
+        self.assertEqual(result["kept"]["references"], ["c.txt"])
+        # Stored content metadata is untouched.
+        self.assertEqual(result["kept"]["bytes"], 10)
+        self.assertEqual(result["kept"]["sha256"],
+                         hashlib.sha256(b"same body\n").hexdigest())
+
+    def test_kept_only_changes_references_other_fields_preserved(self):
+        batch = {"K": self.record("K", tags=["z"], archived=True, category="C",
+                                  version_note=" note ", extra={"n": 2},
+                                  references=["A"]),
+                 "A": self.record("A", tags=["q"])}
+        self.room.import_records(batch)
+        result = self.room.merge_duplicates("K", ["A"])
+        kept = result["kept"]
+        self.assertEqual(kept["tags"], ["z"])
+        self.assertTrue(kept["archived"])
+        self.assertEqual(kept["category"], "C")
+        self.assertEqual(kept["version_note"], " note ")
+        self.assertEqual(kept["extra"], {"n": 2})
+        self.assertEqual(kept["references"], ["K"])
+
+    def test_validation_errors_leave_index_untouched(self):
+        self._register_duplicates()
+        before = self.index.read_text(encoding="utf-8")
+        for args in ((None, ["b.txt"]),
+                     (7, ["b.txt"]),
+                     ("a.txt", None),
+                     ("a.txt", "b.txt"),
+                     ("a.txt", []),
+                     ("a.txt", ()),
+                     ("a.txt", ["b.txt", None]),
+                     ("a.txt", [7]),
+                     ("a.txt", ["A.TXT"]),           # case-sensitive key
+                     ("ghost.txt", ["b.txt"]),       # unregistered keep
+                     ("a.txt", ["ghost.txt"]),       # unregistered source
+                     ("a.txt", ["a.txt"]),           # source contains keep
+                     ("c.txt", ["a.txt"]),           # bytes/digest mismatch
+                     ("d.txt", ["a.txt", "c.txt"])):  # one source mismatches
+            with self.assertRaises(ValueError, msg=repr(args)):
+                self.room.merge_duplicates(*args)
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_digest_compared_as_exact_string(self):
+        batch = {"K": self.record("K", sha256="abc"),
+                 "A": self.record("A", sha256="ABC")}
+        self.room.import_records(batch)
+        before = self.index.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.merge_duplicates("K", ["A"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_whole_index_validated_including_unrelated_records(self):
+        self._register_duplicates()
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.merge_duplicates("a.txt", ["b.txt"])
+        stored = json.loads(valid)
+        stored["d.txt"]["sha256"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.merge_duplicates("a.txt", ["b.txt"])
+        stored = json.loads(valid)
+        stored["d.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.merge_duplicates("a.txt", ["b.txt"])
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.merge_duplicates("a.txt", ["b.txt"])
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.merge_duplicates("a.txt", ["b.txt"])
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_without_index_fails_as_unregistered_and_creates_nothing(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.merge_duplicates("a.txt", ["b.txt"])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_cli_merge_duplicates_exit_codes_and_payload(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        subprocess.run(prefix + ["add", "a.txt", "--tag", "release"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "b.txt", "--tag", "draft"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["add", "c.txt", "--tag", "operations"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["refs", "b.txt", "--to", "c.txt"],
+                       capture_output=True, check=True)
+        subprocess.run(prefix + ["refs", "c.txt", "--to", "b.txt"],
+                       capture_output=True, check=True)
+        result = subprocess.run(prefix + ["merge-duplicates", "a.txt",
+                                          "--from", "b.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(set(payload), {"kept", "removed", "updated"})
+        self.assertEqual(payload["kept"]["path"], "a.txt")
+        self.assertEqual(payload["kept"]["references"], ["c.txt"])
+        self.assertEqual([r["path"] for r in payload["removed"]], ["b.txt"])
+        self.assertEqual([r["path"] for r in payload["updated"]], ["c.txt"])
+        self.assertEqual(payload["updated"][0]["references"], ["a.txt"])
+        # Failures print an error-only JSON object with exit 2.
+        failure = subprocess.run(prefix + ["merge-duplicates", "a.txt",
+                                           "--from", "c.txt"],
+                                 capture_output=True, text=True)
+        self.assertEqual(failure.returncode, 2)
+        self.assertEqual(set(json.loads(failure.stdout)), {"error"})
+        missing = [sys.executable, str(ROOT / "document_room.py"),
+                   "--root", str(self.root), "--index", str(self.root / "fresh.json")]
+        result = subprocess.run(missing + ["merge-duplicates", "a.txt",
+                                           "--from", "b.txt"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        self.assertFalse((self.root / "fresh.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
