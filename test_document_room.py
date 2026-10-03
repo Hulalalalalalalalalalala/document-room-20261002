@@ -1709,6 +1709,266 @@ class RemoveTests(unittest.TestCase):
         self.assertFalse((self.root / "fresh.json").exists())
 
 
+class RemoveBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for name in ("policy.md", "meeting.txt", "a.txt", "b.txt", "c.txt"):
+            (self.root / name).write_text("Contents of " + name, encoding="utf-8")
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def record(self, path, **overrides):
+        record = {"path": path, "name": path.rsplit("/", 1)[-1], "bytes": 10,
+                  "sha256": "hash-" + path, "tags": ["legal"]}
+        record.update(overrides)
+        return record
+
+    def test_removes_many_records_and_returns_full_records_sorted(self):
+        batch = {"a.txt": self.record("a.txt"),
+                "B.txt": self.record("B.txt"),
+                "c.txt": self.record("c.txt", category="Docs")}
+        self.room.import_records(batch)
+        result = self.room.remove_records(["c.txt", "a.txt", "B.txt", "c.txt"])
+        # Duplicate input paths are processed once; removed lists full records
+        # in case-sensitive path order.
+        self.assertEqual([r["path"] for r in result["removed"]], ["B.txt", "a.txt", "c.txt"])
+        self.assertEqual(result["removed"][2], batch["c.txt"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))), set())
+
+    def test_retained_reference_to_batch_member_rejects_whole_batch(self):
+        batch = {"a.txt": self.record("a.txt", references=["b.txt"]),
+                "b.txt": self.record("b.txt"),
+                "c.txt": self.record("c.txt", references=["a.txt"])}
+        self.room.import_records(batch)
+        before = self.index.read_text(encoding="utf-8")
+        # a.txt and b.txt reference one another (allowed inside the batch), but
+        # c.txt is retained and references a.txt.
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt", "b.txt"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        stored = json.loads(before)
+        self.assertEqual(set(stored), {"a.txt", "b.txt", "c.txt"})
+
+    def test_internal_references_self_references_and_cycles_never_block(self):
+        batch = {"a.txt": self.record("a.txt", references=["a.txt", "b.txt"]),
+                "b.txt": self.record("b.txt", references=["a.txt"]),
+                "c.txt": self.record("c.txt")}
+        self.room.import_records(batch)
+        result = self.room.remove_records(["b.txt", "a.txt"])
+        self.assertEqual([r["path"] for r in result["removed"]], ["a.txt", "b.txt"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))), {"c.txt"})
+
+    def test_detach_keeps_referrer_and_clears_every_batched_reference(self):
+        batch = {"a.txt": self.record("a.txt", references=["b.txt"]),
+                "b.txt": self.record("b.txt", references=["a.txt"]),
+                "c.txt": self.record("c.txt", references=["a.txt", "b.txt", "c.txt"])}
+        self.room.import_records(batch)
+        result = self.room.remove_records(["a.txt", "b.txt"], detach=True)
+        # Only c.txt survives; its references to the batch are gone, others kept.
+        self.assertEqual([r["path"] for r in result["removed"]], ["a.txt", "b.txt"])
+        self.assertEqual([r["path"] for r in result["updated"]], ["c.txt"])
+        self.assertEqual(result["updated"][0]["references"], ["c.txt"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"c.txt"})
+        self.assertEqual(stored["c.txt"]["references"], ["c.txt"])
+        # Document files are never touched.
+        self.assertTrue((self.root / "a.txt").is_file())
+        self.assertTrue((self.root / "b.txt").is_file())
+
+    def test_detach_preserves_order_duplicates_empty_list_and_fields(self):
+        batch = {
+            "a.txt": self.record("a.txt"),
+            "b.txt": self.record("b.txt"),
+            "r.md": self.record("r.md",
+                                references=["a.txt", "c.md", "a.txt", "b.txt", "c.md"],
+                                extra={"keep": [1, 2]}),
+            "B.md": self.record("B.md", references=["b.txt", "b.txt"]),
+            "d.md": self.record("d.md", category="Docs"),
+            "c.md": self.record("c.md"),
+        }
+        self.room.import_records(batch)
+        result = self.room.remove_records(["a.txt", "b.txt"], detach=True)
+        self.assertEqual([r["path"] for r in result["removed"]], ["a.txt", "b.txt"])
+        # Case-sensitive ordering: B.md before r.md.
+        self.assertEqual([r["path"] for r in result["updated"]], ["B.md", "r.md"])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"B.md", "c.md", "d.md", "r.md"})
+        # Surviving references keep their order and duplicates.
+        self.assertEqual(stored["r.md"]["references"], ["c.md", "c.md"])
+        self.assertEqual(stored["r.md"]["extra"], {"keep": [1, 2]})
+        # Cleared references remain an explicit empty list.
+        self.assertEqual(stored["B.md"]["references"], [])
+        # Records without a references field do not gain one and are not listed.
+        self.assertNotIn("references", stored["d.md"])
+        self.assertFalse(any(r["path"] == "d.md" for r in result["updated"]))
+        # Unaffected records stay byte-for-byte identical.
+        self.assertEqual(stored["c.md"], batch["c.md"])
+
+    def test_detach_does_not_recurse_along_reference_edges(self):
+        batch = {"a.md": self.record("a.md", references=["b.md"]),
+                 "b.md": self.record("b.md", references=["c.md"]),
+                 "c.md": self.record("c.md")}
+        self.room.import_records(batch)
+        result = self.room.remove_records(["b.md"], detach=True)
+        self.assertEqual([r["path"] for r in result["updated"]], ["a.md"])
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))),
+                         {"a.md", "c.md"})
+
+    def test_paths_are_exact_case_sensitive_keys(self):
+        self.room.import_records({"a.txt": self.record("a.txt")})
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["A.TXT"])
+        self.assertIn("a.txt", json.loads(self.index.read_text(encoding="utf-8")))
+
+    def test_works_when_original_files_are_missing_or_changed(self):
+        batch = {"a.txt": self.record("a.txt"), "b.txt": self.record("b.txt")}
+        self.room.import_records(batch)
+        (self.root / "a.txt").unlink()
+        (self.root / "b.txt").write_text("completely different content now")
+        result = self.room.remove_records(["a.txt", "b.txt"])
+        self.assertEqual([r["path"] for r in result["removed"]], ["a.txt", "b.txt"])
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+
+    def test_empty_container_validates_index_and_writes_nothing(self):
+        self.room.add("policy.md", ["legal"])
+        before = self.index.read_text(encoding="utf-8")
+        for empty in ([], ()):
+            result = self.room.remove_records(empty)
+            self.assertEqual(result, {"removed": [], "updated": []})
+            self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # A corrupt index still fails validation even for an empty batch.
+        self.index.write_text("{broken", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_records([])
+
+    def test_missing_index_nonempty_fails_without_creating_file(self):
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        with self.assertRaises(ValueError):
+            fresh.remove_records(["a.txt"])
+        with self.assertRaises(ValueError):
+            fresh.remove_records(["a.txt"], detach=True)
+        self.assertFalse((self.root / "fresh.json").exists())
+        # An empty batch against a missing index succeeds and creates nothing.
+        self.assertEqual(fresh.remove_records([]), {"removed": [], "updated": []})
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_parameter_validation_leaves_index_untouched(self):
+        self.room.import_records({"a.txt": self.record("a.txt")})
+        before = self.index.read_text(encoding="utf-8")
+        for paths in (None, "a.txt", 7, {"a.txt"}, ["a.txt", None],
+                      ["a.txt", 3], (None,)):
+            with self.assertRaises(ValueError, msg=repr(paths)):
+                self.room.remove_records(paths)
+        for detach in ("yes", 1, None):
+            with self.assertRaises(ValueError, msg=repr(detach)):
+                self.room.remove_records(["a.txt"], detach=detach)
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt", "ghost.txt"])
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+
+    def test_whole_index_validated_before_changes(self):
+        valid_batch = {"a.txt": self.record("a.txt"),
+                       "p.txt": self.record("p.txt", references=["a.txt"])}
+        self.room.import_records(valid_batch)
+        valid = self.index.read_text(encoding="utf-8")
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt"], detach=True)
+        # A dangling reference on an unrelated record invalidates the batch.
+        stored = json.loads(valid)
+        stored["p.txt"]["references"] = ["ghost.txt"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt"], detach=True)
+        # A malformed public field on an unrelated record does too.
+        stored = json.loads(valid)
+        stored["p.txt"]["bytes"] = "10"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt"], detach=True)
+        stored = json.loads(valid)
+        stored["p.txt"]["archived"] = "yes"
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt"], detach=True)
+        stored = json.loads(valid)
+        stored["p.txt"]["version_note"] = 5
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt"], detach=True)
+        self.index.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ValueError):
+            self.room.remove_records(["a.txt"], detach=True)
+        self.index.write_text(valid, encoding="utf-8")
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.remove_records(["a.txt"], detach=True)
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_tuples_accepted_as_path_containers(self):
+        self.room.import_records({"a.txt": self.record("a.txt"),
+                                  "b.txt": self.record("b.txt")})
+        result = self.room.remove_records(("a.txt", "b.txt"))
+        self.assertEqual([r["path"] for r in result["removed"]], ["a.txt", "b.txt"])
+
+    def test_later_queries_and_reference_expansion_use_remaining_records(self):
+        batch = {"a.txt": self.record("a.txt", references=["b.txt"], tags=["legal"]),
+                "b.txt": self.record("b.txt"),
+                "c.txt": self.record("c.txt", references=["a.txt"], tags=["legal"])}
+        self.room.import_records(batch)
+        self.room.remove_records(["a.txt", "b.txt"], detach=True)
+        self.assertEqual([r["path"] for r in self.room.search()], ["c.txt"])
+        self.assertEqual(sorted(self.room.export_records(tags=["legal"])), ["c.txt"])
+        manifest = self.room.export_manifest("R1", include_references=True)
+        self.assertEqual([d["path"] for d in manifest["documents"]], ["c.txt"])
+        with self.assertRaises(ValueError):
+            self.room.reference_impact("a.txt")
+
+    def test_cli_batch_blocked_detach_and_empty_paths(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        self.room.import_records({
+            "a.txt": self.record("a.txt", references=["b.txt"]),
+            "b.txt": self.record("b.txt", references=["a.txt"]),
+            "c.txt": self.record("c.txt", references=["a.txt"])})
+        # Default mode fails with exit 2 and leaves the index intact.
+        blocked = subprocess.run(prefix + ["remove-batch", "a.txt", "b.txt"],
+                                 capture_output=True, text=True)
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("error", json.loads(blocked.stdout))
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))),
+                         {"a.txt", "b.txt", "c.txt"})
+        # No paths is a CLI usage failure with exit 2, even though the Python
+        # empty batch would validate.
+        no_paths = subprocess.run(prefix + ["remove-batch"],
+                                  capture_output=True, text=True)
+        self.assertEqual(no_paths.returncode, 2)
+        self.assertIn("error", json.loads(no_paths.stdout))
+        # Detach succeeds with the {removed, updated} payload.
+        ok = subprocess.run(prefix + ["remove-batch", "a.txt", "b.txt", "--detach"],
+                            capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        payload = json.loads(ok.stdout)
+        self.assertEqual([r["path"] for r in payload["removed"]], ["a.txt", "b.txt"])
+        self.assertEqual([r["path"] for r in payload["updated"]], ["c.txt"])
+        self.assertEqual(payload["updated"][0]["references"], [])
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), {"c.txt"})
+        # An unregistered path fails with exit 2 and no partial removal.
+        again = subprocess.run(prefix + ["remove-batch", "a.txt", "c.txt", "--detach"],
+                               capture_output=True, text=True)
+        self.assertEqual(again.returncode, 2)
+        self.assertIn("error", json.loads(again.stdout))
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))),
+                         {"c.txt"})
+
+
 class ImportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)

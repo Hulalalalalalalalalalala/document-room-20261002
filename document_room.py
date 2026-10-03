@@ -232,6 +232,53 @@ class DocumentRoom:
         return {"removed": removed,
                 "updated": sorted(updated, key=lambda record: record["path"])}
 
+    def remove_records(self, paths, detach=False):
+        if not isinstance(paths, (list, tuple)):
+            raise ValueError("paths must be a list or tuple of strings")
+        if not all(isinstance(path, str) for path in paths):
+            raise ValueError("paths must contain only strings")
+        if not isinstance(detach, bool):
+            raise ValueError("detach must be a boolean")
+        # The whole index must be structurally sound before anything changes.
+        records = self._load_validated_with_version_notes()
+        unique_paths = list(dict.fromkeys(paths))  # duplicates handled once
+        for path in unique_paths:
+            if path not in records:
+                raise ValueError("document is not registered: " + path)
+        batch = set(unique_paths)
+        removed = [records[path] for path in unique_paths]
+        # Only references held by records that stay can block the batch;
+        # references between batch members, self-references and cycles leave
+        # with the removed records themselves. The check runs before anything
+        # is mutated, so a rejection leaves the index bytes untouched.
+        for source, record in records.items():
+            if source in batch or "references" not in record:
+                continue
+            if any(target in batch for target in record["references"]) and not detach:
+                raise ValueError("document is referenced by another record")
+        # Detaching deletes every occurrence pointing at a batch member from
+        # each surviving record; order and duplicates of other targets are
+        # preserved, an emptied array stays [], and records without a
+        # references field never gain one. No other registrations are removed
+        # recursively along the reference edges.
+        updated = []
+        retained = {}
+        for source, record in records.items():
+            if source in batch:
+                continue
+            if ("references" in record
+                    and any(target in batch for target in record["references"])):
+                if detach:
+                    record["references"] = [target for target in record["references"]
+                                            if target not in batch]
+                    updated.append(record)
+            retained[source] = record
+        if unique_paths:  # an empty batch validates the index but never writes it
+            self.index.write_text(json.dumps(retained, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+        return {"removed": sorted(removed, key=lambda record: record["path"]),
+                "updated": sorted(updated, key=lambda record: record["path"])}
+
     def relocate_record(self, source, destination):
         if not isinstance(source, str) or not isinstance(destination, str):
             raise ValueError("source and destination paths must be strings")
@@ -1121,6 +1168,9 @@ def main():
     remove = commands.add_parser("remove")
     remove.add_argument("path")
     remove.add_argument("--detach", action="store_true")
+    remove_batch = commands.add_parser("remove-batch")
+    remove_batch.add_argument("paths", nargs="*")
+    remove_batch.add_argument("--detach", action="store_true")
     tag_edit = commands.add_parser("tags")
     tag_edit.add_argument("paths", nargs="*")
     tag_edit.add_argument("--add", action="append", default=[])
@@ -1185,6 +1235,10 @@ def main():
             result = room.set_version_note(args.path, args.value)
         elif args.command == "remove":
             result = room.remove_record(args.path, detach=args.detach)
+        elif args.command == "remove-batch":
+            if not args.paths:
+                raise ValueError("at least one path is required")
+            result = room.remove_records(args.paths, detach=args.detach)
         elif args.command == "tags":
             if not args.paths:
                 raise ValueError("at least one path is required")
