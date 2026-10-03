@@ -3047,5 +3047,251 @@ class EditTagsTests(unittest.TestCase):
         self.assertIn("error", json.loads(result.stdout))
 
 
+class ReleaseBlockersTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.index = self.root / "index.json"
+        self.room = DocumentRoom(self.root, self.index)
+
+    def _add(self, name, tags=(), content=None):
+        (self.root / name).write_text(
+            content if content is not None else f"Content of {name}\n",
+            encoding="utf-8")
+        return self.room.add(name, tags)
+
+    def _delete(self, name):
+        (self.root / name).unlink()
+
+    def _export(self, tags=("release",)):
+        return self.room.export_manifest(
+            "R1", list(tags), include_references=True, include_blockers=True)
+
+    def test_blockers_list_reachable_non_ready_documents(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self._add("c.md")
+        self.room.set_references("a.md", ["b.md"])
+        self.room.set_references("b.md", ["c.md"])
+        self._delete("c.md")
+        manifest = self._export()
+        # The documents array keeps its usual shape and ordering.
+        self.assertEqual([d["path"] for d in manifest["documents"]],
+                         ["a.md", "b.md", "c.md"])
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(len(manifest["blockers"]), 1)
+        entry = manifest["blockers"][0]
+        self.assertEqual(entry["path"], "a.md")
+        self.assertEqual(entry["documents"],
+                         [{"path": "c.md", "status": "missing",
+                           "distance": 2, "route": ["a.md", "b.md", "c.md"]}])
+        self.assertEqual(set(entry["documents"][0]),
+                         {"path", "status", "distance", "route"})
+        # The blocker status is the same status the manifest document carries.
+        statuses = {d["path"]: d["status"] for d in manifest["documents"]}
+        self.assertEqual(entry["documents"][0]["status"], statuses["c.md"])
+        # A ready graph reports no blockers at all.
+        self._add("c.md")
+        self.assertEqual(self._export()["blockers"], [])
+
+    def test_blocked_start_has_distance_zero_and_self_route(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self.room.set_references("a.md", ["b.md"])
+        self._delete("a.md")
+        self._delete("b.md")
+        entry = self._export()["blockers"][0]
+        self.assertEqual(entry["path"], "a.md")
+        self.assertEqual([d["path"] for d in entry["documents"]], ["a.md", "b.md"])
+        self.assertEqual(entry["documents"][0],
+                         {"path": "a.md", "status": "missing",
+                          "distance": 0, "route": ["a.md"]})
+        self.assertEqual(entry["documents"][1]["distance"], 1)
+        self.assertEqual(entry["documents"][1]["route"], ["a.md", "b.md"])
+
+    def test_shared_blocker_listed_under_every_affected_start(self):
+        self._add("a.md", ["release"])
+        self._add("b.md", ["release"])
+        self._add("c.md")
+        self._add("d.md", ["release"])
+        self._add("e.md")
+        self.room.set_references("a.md", ["c.md"])
+        self.room.set_references("b.md", ["c.md"])
+        self.room.set_references("d.md", ["e.md"])
+        self._delete("c.md")
+        blockers = self._export()["blockers"]
+        # The unaffected ready start d.md does not appear; entries sort by path.
+        self.assertEqual([entry["path"] for entry in blockers], ["a.md", "b.md"])
+        self.assertEqual(blockers[0]["documents"],
+                         [{"path": "c.md", "status": "missing",
+                           "distance": 1, "route": ["a.md", "c.md"]}])
+        self.assertEqual(blockers[1]["documents"],
+                         [{"path": "c.md", "status": "missing",
+                           "distance": 1, "route": ["b.md", "c.md"]}])
+
+    def test_tracking_continues_through_blocked_intermediates(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self._add("c.md", content="original\n")
+        self.room.set_references("a.md", ["b.md"])
+        self.room.set_references("b.md", ["c.md"])
+        self._delete("b.md")
+        (self.root / "c.md").write_text("changed\n", encoding="utf-8")
+        entry = self._export()["blockers"][0]
+        self.assertEqual([(d["path"], d["status"], d["distance"]) for d in entry["documents"]],
+                         [("b.md", "missing", 1), ("c.md", "changed", 2)])
+
+    def test_shortest_route_tie_break_is_case_sensitive_array_order(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self._add("B.md")
+        self._add("x.md")
+        self.room.set_references("a.md", ["b.md", "B.md"])
+        self.room.set_references("b.md", ["x.md"])
+        self.room.set_references("B.md", ["x.md"])
+        self._delete("x.md")
+        documents = self._export()["blockers"][0]["documents"]
+        # Capital "B" sorts before lowercase "b" in case-sensitive order.
+        self.assertEqual(documents[0]["route"], ["a.md", "B.md", "x.md"])
+        self.assertEqual(documents[0]["distance"], 2)
+
+    def test_cycles_and_self_references_keep_short_simple_routes(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self._add("x.md")
+        self.room.set_references("a.md", ["a.md", "b.md"])
+        self.room.set_references("b.md", ["a.md", "x.md"])
+        self._delete("x.md")
+        documents = self._export()["blockers"][0]["documents"]
+        by_path = {d["path"]: d for d in documents}
+        self.assertEqual(by_path["x.md"]["distance"], 2)
+        self.assertEqual(by_path["x.md"]["route"], ["a.md", "b.md", "x.md"])
+        for document in documents:
+            self.assertEqual(len(document["route"]), len(set(document["route"])))
+        # A self-referential loop on the start never creates an entry by itself.
+        self.room.set_references("b.md", ["a.md"])
+        self._add("x.md")
+        self.assertEqual(self._export()["blockers"], [])
+
+    def test_reference_only_documents_are_not_starting_documents(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self._add("c.md")
+        self.room.set_references("a.md", ["b.md"])
+        self.room.set_references("b.md", ["c.md"])
+        self._delete("b.md")
+        self._delete("c.md")
+        blockers = self._export()["blockers"]
+        self.assertEqual([entry["path"] for entry in blockers], ["a.md"])
+        self.assertEqual([d["path"] for d in blockers[0]["documents"]],
+                         ["b.md", "c.md"])
+
+    def test_blocker_entries_and_documents_are_sorted(self):
+        self._add("a.md", ["release"])
+        self._add("z.md", ["release"])
+        for name in ("x1.md", "x2.md", "q.md", "y.md", "m.md"):
+            self._add(name)
+        self.room.set_references("a.md", ["x1.md", "x2.md", "q.md"])
+        self.room.set_references("q.md", ["y.md"])
+        self.room.set_references("z.md", ["m.md"])
+        for name in ("x1.md", "x2.md", "y.md", "m.md"):
+            self._delete(name)
+        entries = {entry["path"]: entry for entry in self._export()["blockers"]}
+        self.assertEqual(list(entries), ["a.md", "z.md"])  # outer: start path
+        self.assertEqual([(d["distance"], d["path"]) for d in entries["a.md"]["documents"]],
+                         [(1, "x1.md"), (1, "x2.md"), (2, "y.md")])
+        self.assertEqual([d["path"] for d in entries["z.md"]["documents"]], ["m.md"])
+
+    def test_blockers_require_reference_expansion_and_boolean(self):
+        self._add("a.md", ["release"])
+        with self.assertRaises(ValueError):
+            self.room.export_manifest("R1", ["release"], include_blockers=True)
+        for bad in (1, "yes", None):
+            with self.assertRaises(ValueError):
+                self.room.export_manifest("R1", ["release"], include_references=True,
+                                          include_blockers=bad)
+
+    def test_blockers_key_only_present_when_enabled(self):
+        self._add("a.md", ["release"])
+        enabled = self.room.export_manifest("R1", ["release"], include_references=True,
+                                            include_blockers=True)
+        self.assertIn("blockers", enabled)
+        disabled = self.room.export_manifest("R1", ["release"], include_references=True)
+        self.assertEqual(set(disabled), {"release", "complete", "documents"})
+        plain = self.room.export_manifest("R1", ["release"])
+        self.assertEqual(set(plain), {"release", "complete", "documents"})
+
+    def test_blockers_empty_selection_and_missing_index(self):
+        self._add("a.md", ["release"])
+        empty = self.room.export_manifest(
+            "R1", ["nothing"], include_references=True, include_blockers=True)
+        self.assertEqual(empty["documents"], [])
+        self.assertEqual(empty["blockers"], [])
+        self.assertFalse(empty["complete"])
+        fresh = DocumentRoom(self.root, self.root / "fresh.json")
+        missing = fresh.export_manifest(
+            "R1", include_references=True, include_blockers=True)
+        self.assertEqual(missing["blockers"], [])
+        self.assertFalse(missing["complete"])
+        self.assertFalse((self.root / "fresh.json").exists())
+
+    def test_blockers_validate_the_whole_index(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        stored["b.md"]["references"] = ["ghost.md"]
+        self.index.write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self._export()
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self._export()
+
+    def test_blockers_combine_with_origins_and_version_notes(self):
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self.room.set_version_note("a.md", "v1")
+        self.room.set_references("a.md", ["b.md"])
+        self._delete("b.md")
+        manifest = self.room.export_manifest(
+            "R1", ["release"], include_references=True, include_blockers=True,
+            include_origins=True, include_version_notes=True)
+        by_path = {d["path"]: d for d in manifest["documents"]}
+        self.assertEqual(by_path["a.md"]["origins"], [{"path": "a.md", "distance": 0}])
+        self.assertEqual(by_path["a.md"]["version_note"], "v1")
+        self.assertEqual(manifest["blockers"][0]["documents"][0]["path"], "b.md")
+
+    def test_cli_export_with_blockers(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        self._add("a.md", ["release"])
+        self._add("b.md")
+        self.room.set_references("a.md", ["b.md"])
+        self._delete("b.md")
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--tag", "release",
+                                          "--with-references", "--with-blockers"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        self.assertEqual(manifest["blockers"][0]["path"], "a.md")
+        self.assertEqual(manifest["blockers"][0]["documents"][0]["status"], "missing")
+        # Blockers without reference expansion is a JSON error with exit 2.
+        result = subprocess.run(prefix + ["export", "--release", "R1",
+                                          "--with-blockers"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # The flag combines with the other export annotations.
+        result = subprocess.run(prefix + ["export", "--release", "R1", "--tag", "release",
+                                          "--with-references", "--with-blockers",
+                                          "--with-origins", "--with-version-notes"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        self.assertIn("blockers", manifest)
+        self.assertIn("origins", manifest["documents"][0])
+
+
 if __name__ == "__main__":
     unittest.main()

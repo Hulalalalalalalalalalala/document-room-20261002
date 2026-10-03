@@ -472,9 +472,42 @@ class DocumentRoom:
         except (OSError, RuntimeError, ValueError):
             return "unreadable"
 
+    @staticmethod
+    def _release_blockers(records, starts, status_by_path):
+        blockers = []
+        for start in sorted(starts):
+            # Breadth-first along the reference direction keeps every route
+            # the shortest one; expansion continues through non-ready
+            # documents. Equal-length routes tie-break on the case-sensitive
+            # lexicographic order of the full path array.
+            routes = {start: [start]}
+            frontier = [start]
+            while frontier:
+                nxt = []
+                for node in frontier:
+                    node_route = routes[node]
+                    for target in records[node].get("references", []):
+                        candidate = node_route + [target]
+                        if target not in routes:
+                            routes[target] = candidate
+                            nxt.append(target)
+                        elif len(candidate) == len(routes[target]) and candidate < routes[target]:
+                            routes[target] = candidate
+                frontier = nxt
+            documents = []
+            for path, route in sorted(routes.items(),
+                                      key=lambda item: (len(item[1]) - 1, item[0])):
+                if status_by_path[path] == "ready":
+                    continue  # the start itself is included only when blocked
+                documents.append({"path": path, "status": status_by_path[path],
+                                  "distance": len(route) - 1, "route": route})
+            if documents:
+                blockers.append({"path": start, "documents": documents})
+        return blockers
+
     def export_manifest(self, release, tags=(), text="", include_references=False,
                         archive_state="all", category=None, include_origins=False,
-                        include_version_notes=False):
+                        include_version_notes=False, include_blockers=False):
         if not isinstance(release, str) or not release.strip():
             raise ValueError("release must be a non-empty string")
         self._check_archive_state(archive_state)
@@ -485,6 +518,10 @@ class DocumentRoom:
             raise ValueError("include_origins requires include_references")
         if not isinstance(include_version_notes, bool):
             raise ValueError("include_version_notes must be a boolean")
+        if not isinstance(include_blockers, bool):
+            raise ValueError("include_blockers must be a boolean")
+        if include_blockers and not include_references:
+            raise ValueError("include_blockers requires include_references")
         release = release.strip()
         wanted = {tag.strip().lower() for tag in tags if tag.strip()}
 
@@ -538,10 +575,13 @@ class DocumentRoom:
         else:
             ordered = [record for _, record in sorted(records.items()) if matches(record)]
         documents = []
+        status_by_path = {}
         for record in ordered:
+            status = self._file_status(record)
+            status_by_path[record["path"]] = status
             document = {"path": record["path"], "name": record["name"],
                         "bytes": record["bytes"], "sha256": record["sha256"],
-                        "tags": record["tags"], "status": self._file_status(record)}
+                        "tags": record["tags"], "status": status}
             if include_origins:
                 document["origins"] = [
                     {"path": source, "distance": origins[record["path"]][source]}
@@ -551,9 +591,12 @@ class DocumentRoom:
                 # export an empty note; referenced documents keep their own.
                 document["version_note"] = record.get("version_note", "")
             documents.append(document)
-        return {"release": release,
-                "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
-                "documents": documents}
+        result = {"release": release,
+                  "complete": bool(documents) and all(d["status"] == "ready" for d in documents),
+                  "documents": documents}
+        if include_blockers:
+            result["blockers"] = self._release_blockers(records, starts, status_by_path)
+        return result
 
     @staticmethod
     def _validated_manifest(manifest):
@@ -762,6 +805,7 @@ def main():
     export.add_argument("--with-references", action="store_true")
     export.add_argument("--with-origins", action="store_true")
     export.add_argument("--with-version-notes", action="store_true")
+    export.add_argument("--with-blockers", action="store_true")
     export.add_argument("--archive-state", default="all")
     export.add_argument("--category", default=None)
     compare = commands.add_parser("compare")
@@ -828,7 +872,8 @@ def main():
                                           archive_state=args.archive_state,
                                           category=args.category,
                                           include_origins=args.with_origins,
-                                          include_version_notes=args.with_version_notes)
+                                          include_version_notes=args.with_version_notes,
+                                          include_blockers=args.with_blockers)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError) as exc:
