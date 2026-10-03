@@ -308,7 +308,7 @@ class DocumentRoom:
             if "category" in record and not isinstance(record["category"], str):
                 raise ValueError("record category must be a string")
 
-    def import_records(self, batch):
+    def _prepare_import(self, batch):
         if not isinstance(batch, dict):
             raise ValueError("import batch must be an object of records")
         existing = self._load()
@@ -317,6 +317,50 @@ class DocumentRoom:
         # Bad records fail the whole batch even when their paths are not imported.
         self._validate_importable(existing)
         self._validate_importable(batch)
+        return existing
+
+    @staticmethod
+    def _import_field_differences(existing, incoming):
+        # Top-level fields that are new, missing or value-different. Every
+        # nested difference is attributed to its top-level field, and equality
+        # follows the import rules: array order is significant, object key
+        # order is not, and a missing optional field differs from its
+        # explicit default.
+        fields = set(existing) ^ set(incoming)
+        fields.update(field for field in existing.keys() & incoming.keys()
+                      if existing[field] != incoming[field])
+        return sorted(fields)
+
+    def preview_import(self, batch):
+        existing = self._prepare_import(batch)
+        added = []
+        unchanged = []
+        conflicts = []
+        for key in sorted(set(existing) | set(batch)):
+            if key not in existing:
+                added.append(key)
+            elif key not in batch:
+                continue
+            elif existing[key] == batch[key]:  # field set and values, arrays ordered
+                unchanged.append(key)
+            else:
+                conflicts.append({"path": key, "existing": existing[key],
+                                  "incoming": batch[key],
+                                  "fields": self._import_field_differences(
+                                      existing[key], batch[key])})
+        # Reference targets are resolved against the union of registered paths
+        # and batch paths, checked on every record of both sides so a
+        # conflicting record can neither introduce nor hide a dangling target.
+        for records in (existing, batch):
+            for record in records.values():
+                for target in record.get("references", []):
+                    if target not in existing and target not in batch:
+                        raise ValueError("record references an unregistered path")
+        return {"can_import": not conflicts,
+                "added": added, "unchanged": unchanged, "conflicts": conflicts}
+
+    def import_records(self, batch):
+        existing = self._prepare_import(batch)
         added = []
         unchanged = []
         for key, record in batch.items():
@@ -822,6 +866,7 @@ def main():
     compare.add_argument("--compare-version-notes", action="store_true")
     importer = commands.add_parser("import")
     importer.add_argument("--from", dest="from_path", required=True)
+    importer.add_argument("--preview", action="store_true")
     dump = commands.add_parser("dump")
     dump.add_argument("--tag", action="append", default=[])
     dump.add_argument("--text", default="")
@@ -869,7 +914,8 @@ def main():
                 raise ValueError(f"import file is not valid UTF-8: {exc}")
             except json.JSONDecodeError as exc:
                 raise ValueError(f"import file is not valid JSON: {exc}")
-            result = room.import_records(batch)
+            result = (room.preview_import(batch) if args.preview
+                      else room.import_records(batch))
         elif args.command == "dump":
             result = room.export_records(args.tag, args.text, args.archive_state,
                                          args.category)

@@ -1680,6 +1680,249 @@ class ImportTests(unittest.TestCase):
         stored = json.loads(self.index.read_text(encoding="utf-8"))
         self.assertEqual(stored["policy.md"]["bytes"], 10)
 
+    def test_preview_reports_added_unchanged_and_conflicts(self):
+        self.room.import_records({"a.md": self.record("a.md", tags=["x"]),
+                                  "b.md": self.record("b.md", archived=True)})
+        batch = {"new.md": self.record("new.md", extra={"keep": [1, 2]}),
+                 "a.md": self.record("a.md", tags=["x"]),
+                 "b.md": self.record("b.md", archived=False)}
+        preview = self.room.preview_import(batch)
+        self.assertEqual(preview, {
+            "can_import": False,
+            "added": ["new.md"],
+            "unchanged": ["a.md"],
+            "conflicts": [
+                {"path": "b.md",
+                 "existing": self.record("b.md", archived=True),
+                 "incoming": self.record("b.md", archived=False),
+                 "fields": ["archived"]}]})
+
+    def test_preview_full_conflict_payload_and_sorted_fields(self):
+        self.room.import_records({"a.md": self.record("a.md", tags=["x", "y"],
+                                                      archived=True,
+                                                      extra={"nested": {"b": 1, "a": 2}})})
+        incoming = self.record("a.md", tags=["x", "y"], category="Legal",
+                               extra={"nested": {"a": 2, "b": 9}},
+                               brand_new=[1])
+        preview = self.room.preview_import({"a.md": incoming})
+        self.assertFalse(preview["can_import"])
+        self.assertEqual(preview["added"], [])
+        self.assertEqual(preview["unchanged"], [])
+        conflict = preview["conflicts"][0]
+        # Both complete records are retained; nested differences fold into the
+        # top-level field and the field list is sorted by name.
+        self.assertEqual(conflict["path"], "a.md")
+        self.assertEqual(conflict["existing"],
+                         self.record("a.md", tags=["x", "y"], archived=True,
+                                     extra={"nested": {"b": 1, "a": 2}}))
+        self.assertEqual(conflict["incoming"], incoming)
+        self.assertEqual(conflict["fields"],
+                         ["archived", "brand_new", "category", "extra"])
+
+    def test_preview_equality_rules_match_import(self):
+        self.room.import_records({"a.md": self.record("a.md", tags=["x", "y"]),
+                                  "b.md": self.record("b.md"),
+                                  "c.md": self.record("c.md", archived=False)})
+        # Array order conflicts; object key order does not.
+        preview = self.room.preview_import({
+            "a.md": self.record("a.md", tags=["y", "x"]),
+            "b.md": dict(reversed(list(self.record("b.md").items()))),
+            "c.md": self.record("c.md", archived=False)})
+        self.assertEqual([c["path"] for c in preview["conflicts"]], ["a.md"])
+        self.assertEqual(preview["conflicts"][0]["fields"], ["tags"])
+        self.assertEqual(preview["unchanged"], ["b.md", "c.md"])
+        # A missing optional field conflicts with its explicit default.
+        preview = self.room.preview_import({"c.md": self.record("c.md")})
+        self.assertEqual(preview["conflicts"][0]["fields"], ["archived"])
+        # Extra fields participate in the comparison.
+        preview = self.room.preview_import({"c.md": self.record("c.md", archived=False,
+                                                                surprise=1)})
+        self.assertEqual(preview["conflicts"][0]["fields"], ["surprise"])
+
+    def test_preview_paths_are_case_sensitive_and_categories_exclusive(self):
+        self.room.import_records({"a.md": self.record("a.md", category=" Legal ")})
+        preview = self.room.preview_import({
+            "A.md": self.record("A.md"),
+            "a.md": self.record("a.md", category="legal")})
+        self.assertEqual(preview["added"], ["A.md"])
+        self.assertEqual(preview["unchanged"], [])
+        self.assertEqual([c["path"] for c in preview["conflicts"]], ["a.md"])
+        self.assertEqual(preview["conflicts"][0]["fields"], ["category"])
+        # Registered paths absent from the batch appear in no category.
+        preview = self.room.preview_import({"new.md": self.record("new.md")})
+        self.assertEqual(preview, {"can_import": True, "added": ["new.md"],
+                                   "unchanged": [], "conflicts": []})
+
+    def test_preview_empty_batch_and_missing_index(self):
+        self.assertEqual(self.room.preview_import({}),
+                         {"can_import": True, "added": [], "unchanged": [],
+                          "conflicts": []})
+        self.assertFalse(self.index.exists())
+        self.assertFalse((self.root / "nested").exists())
+        nested = DocumentRoom(self.root, self.root / "nested" / "index.json")
+        self.assertEqual(nested.preview_import({}),
+                         {"can_import": True, "added": [], "unchanged": [],
+                          "conflicts": []})
+        self.assertFalse((self.root / "nested").exists())
+
+    def test_preview_is_read_only(self):
+        self.room.import_records({"a.md": self.record("a.md")})
+        before = self.index.read_text(encoding="utf-8")
+        batch = {"a.md": self.record("a.md", bytes=11),
+                 "new.md": self.record("new.md", references=["a.md"])}
+        batch_snapshot = json.loads(json.dumps(batch))
+        preview = self.room.preview_import(batch)
+        self.assertFalse(preview["can_import"])
+        # Nothing was written, created or mutated, even the incoming dict.
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        self.assertEqual(batch, batch_snapshot)
+        nested = DocumentRoom(self.root, self.root / "deep" / "index.json")
+        nested.preview_import({"x.md": self.record("x.md")})
+        self.assertFalse((self.root / "deep").exists())
+
+    def test_preview_validates_structure_without_partial_results(self):
+        good = self.record("ok.md")
+        bad_batches = [
+            [good],
+            {"ok.md": ["not", "a", "record"]},
+            {"ok.md": self.record("other.md")},
+            {"ok.md": self.record("ok.md", name=1)},
+            {"ok.md": self.record("ok.md", bytes=True)},
+            {"ok.md": self.record("ok.md", sha256=5)},
+            {"ok.md": self.record("ok.md", tags="legal")},
+            {"ok.md": self.record("ok.md", archived="yes")},
+            {"ok.md": self.record("ok.md", references=[1])},
+            {"ok.md": self.record("ok.md", category=7)},
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.room.preview_import(batch)
+        # A bad record elsewhere in the stored index also blocks the preview.
+        self.room.add("policy.md")
+        records = json.loads(self.index.read_text(encoding="utf-8"))
+        records["junk.md"] = {"path": "junk.md", "name": "junk.md", "bytes": True,
+                              "sha256": "x", "tags": []}
+        self.index.write_text(json.dumps(records), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.preview_import({"new.md": self.record("new.md")})
+
+    def test_preview_validates_all_references_including_conflicts(self):
+        self.room.import_records({"keep.md": self.record("keep.md"),
+                                  "a.md": self.record("a.md", references=["keep.md"])})
+        # A dangling reference on a conflicting record is still rejected.
+        with self.assertRaises(ValueError):
+            self.room.preview_import({"a.md": self.record("a.md", bytes=1,
+                                                          references=["ghost.md"])})
+        # A stored reference the batch satisfies resolves against the union.
+        preview = self.room.preview_import(
+            {"a.md": self.record("a.md", references=["keep.md"]),
+             "keep.md": self.record("keep.md")})
+        self.assertTrue(preview["can_import"])
+        # Forward, self and cyclic references inside the batch are legal.
+        batch = {"p.md": self.record("p.md", references=["m.md"]),
+                 "m.md": self.record("m.md", references=["p.md", "m.md"])}
+        preview = self.room.preview_import(batch)
+        self.assertTrue(preview["can_import"])
+        self.assertEqual(preview["added"], ["m.md", "p.md"])
+        # A batch record pointing outside the union fails, conflicts or not.
+        with self.assertRaises(ValueError):
+            self.room.preview_import({"n.md": self.record("n.md",
+                                                          references=["ghost.md"])})
+        with self.assertRaises(ValueError):
+            self.room.preview_import({"a.md": self.record("a.md",
+                                                          references=["keep.md"]),
+                                      "n.md": self.record("n.md",
+                                                          references=["ghost.md"])})
+
+    def test_preview_corrupt_index_and_read_failure(self):
+        self.index.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.preview_import({"a.md": self.record("a.md")})
+        self.index.write_text(json.dumps([1, 2]), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.room.preview_import({"a.md": self.record("a.md")})
+        os.chmod(self.index, 0)
+        try:
+            with self.assertRaises(OSError):
+                self.room.preview_import({"a.md": self.record("a.md")})
+        finally:
+            os.chmod(self.index, 0o644)
+
+    def test_preview_matches_import_classification(self):
+        self.room.import_records({"a.md": self.record("a.md", references=["b.md"]),
+                                  "b.md": self.record("b.md")})
+        batch = {"a.md": self.record("a.md", references=["b.md"]),
+                 "c.md": self.record("c.md", references=["c.md", "b.md"])}
+        preview = self.room.preview_import(batch)
+        result = self.room.import_records(batch)
+        self.assertTrue(preview["can_import"])
+        self.assertEqual(preview["added"], result["added"])
+        self.assertEqual(preview["unchanged"], result["unchanged"])
+        self.assertEqual(preview["conflicts"], [])
+
+    def test_cli_preview_output_exit_codes_and_read_only(self):
+        prefix = [sys.executable, str(ROOT / "document_room.py"),
+                  "--root", str(self.root), "--index", str(self.index)]
+        batch_path = self.root / "batch.json"
+        self.room.import_records({"policy.md": self.record("policy.md")})
+        before = self.index.read_text(encoding="utf-8")
+        batch = {"meeting.txt": self.record("meeting.txt",
+                                            references=["policy.md", "ghost.md"]),
+                 "policy.md": self.record("policy.md", bytes=999)}
+        batch_path.write_text(json.dumps(batch), encoding="utf-8")
+        # Conflicts and a dangling reference: error JSON, exit 2, no preview.
+        result = subprocess.run(prefix + ["import", "--preview", "--from",
+                                          str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        # Fix the reference: full preview with exit 0 despite the conflict.
+        batch["meeting.txt"]["references"] = ["policy.md"]
+        batch_path.write_text(json.dumps(batch), encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--preview", "--from",
+                                          str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["can_import"])
+        self.assertEqual(payload["added"], ["meeting.txt"])
+        self.assertEqual(payload["unchanged"], [])
+        self.assertEqual([c["path"] for c in payload["conflicts"]], ["policy.md"])
+        self.assertEqual(payload["conflicts"][0]["fields"], ["bytes"])
+        self.assertEqual(payload["conflicts"][0]["existing"],
+                         self.record("policy.md"))
+        self.assertEqual(payload["conflicts"][0]["incoming"],
+                         self.record("policy.md", bytes=999))
+        # Preview changed neither the index nor the source file.
+        self.assertEqual(self.index.read_text(encoding="utf-8"), before)
+        self.assertEqual(json.loads(batch_path.read_text(encoding="utf-8")), batch)
+        # Corrupt source JSON and invalid UTF-8 exit 2 with no partial preview.
+        batch_path.write_text("{not json", encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--preview", "--from",
+                                          str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        batch_path.write_bytes(b"\xff\xfe{}")
+        result = subprocess.run(prefix + ["import", "--preview", "--from",
+                                          str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        # A clean batch previews as importable and still writes nothing.
+        clean = {"only.md": self.record("only.md")}
+        batch_path.write_text(json.dumps(clean), encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--preview", "--from",
+                                          str(batch_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"can_import": True, "added": ["only.md"],
+                          "unchanged": [], "conflicts": []})
+        stored = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("only.md", stored)
+
 
 class DumpTests(unittest.TestCase):
     def setUp(self):
